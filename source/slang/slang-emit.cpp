@@ -32,6 +32,7 @@
 #include "slang-ir-byte-address-legalize.h"
 #include "slang-ir-check-optional-none-usage.h"
 #include "slang-ir-check-recursion.h"
+#include "slang-ir-call-graph.h"
 #include "slang-ir-check-shader-parameter-type.h"
 #include "slang-ir-check-unsupported-inst.h"
 #include "slang-ir-cleanup-void.h"
@@ -102,6 +103,7 @@
 #include "slang-ir-metal-legalize.h"
 #include "slang-ir-missing-return.h"
 #include "slang-ir-optix-entry-point-uniforms.h"
+#include "slang-ir-peephole.h"
 #include "slang-ir-pytorch-cpp-binding.h"
 #include "slang-ir-ray-tracing-legalize.h"
 #include "slang-ir-redundancy-removal.h"
@@ -110,6 +112,7 @@
 #include "slang-ir-restructure-scoping.h"
 #include "slang-ir-restructure.h"
 #include "slang-ir-sccp.h"
+#include "slang-ir-simplify-cfg.h"
 #include "slang-ir-simplify-for-emit.h"
 #include "slang-ir-specialize-address-space.h"
 #include "slang-ir-specialize-arrays.h"
@@ -2993,6 +2996,55 @@ SlangResult CodeGenContext::emitEntryPointsSourceFromIR(ComPtr<IArtifact>& outAr
         specializeModule(linked.module, getTargetProgram(), getSink(), options);
         if (getSink()->getErrorCount())
             return SLANG_FAIL;
+        // Target-switch specialization can leave a branch to the selected intrinsic block.
+        simplifyCFG(linked.module, CFGSimplificationOptions::getFast());
+        Dictionary<IRInst*, HashSet<IRFunc*>> referencingEntryPoints;
+        buildEntryPointReferenceGraph(referencingEntryPoints, linked.module);
+        bool inlined = true;
+        while (inlined)
+        {
+            inlined = false;
+            for (auto global : linked.module->getGlobalInsts())
+            {
+                auto function = as<IRFunc>(global);
+                if (function && referencingEntryPoints.tryGetValue(function))
+                {
+                    if (lowerNX2SpeculatableConditionals(function))
+                    {
+                        simplifyCFG(function, CFGSimplificationOptions::getFast());
+                        inlined = true;
+                    }
+                    inlined |= inlineNX2LeafCalls(function, getTargetProgram());
+                }
+            }
+        }
+        if (linked.entryPoints.getCount() == 1 && lowerNX2MatrixVectorMul(linked.entryPoints[0]))
+        {
+            legalizeMatrixTypes(linked.module, getTargetProgram(), getSink());
+            if (getSink()->getErrorCount())
+                return SLANG_FAIL;
+            // Fold legalized aggregate extracts without rewriting floating-point arithmetic.
+            for (auto block : linked.entryPoints[0]->getBlocks())
+            {
+                for (auto inst = block->getFirstOrdinaryInst(); inst;)
+                {
+                    auto next = inst->getNextInst();
+                    if (inst->getOp() == kIROp_GetElement)
+                        peepholeOptimizeInst(getTargetProgram(), linked.module, inst);
+                    inst = next;
+                }
+            }
+            eliminateDeadCode(linked.entryPoints[0]);
+        }
+        if (linked.entryPoints.getCount() == 1 && linked.entryPoints[0]->getFirstBlock() &&
+            linked.entryPoints[0]->getFirstBlock()->getNextBlock())
+        {
+            eliminatePhisInFunc(
+                LivenessMode::Disabled,
+                linked.module,
+                linked.entryPoints[0],
+                PhiEliminationOptions::getFast());
+        }
         if (getTargetProgram()->getOptionSet().shouldDumpIR())
         {
             DiagnosticSinkWriter writer(getSink());
@@ -3010,6 +3062,7 @@ SlangResult CodeGenContext::emitEntryPointsSourceFromIR(ComPtr<IArtifact>& outAr
         SLANG_RETURN_ON_FAIL(emitNX2Assembly(
             linked.entryPoints[0],
             getSink(),
+            getTargetCaps().implies(CapabilityAtom::nx2_oot_scene_abi),
             &assembly));
         auto artifact = ArtifactUtil::createArtifactForCompileTarget(SLANG_NX2_ASM);
         artifact->addRepresentationUnknown(StringBlob::moveCreate(assembly));

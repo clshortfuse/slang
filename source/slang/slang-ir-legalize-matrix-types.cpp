@@ -26,6 +26,7 @@ static bool targetLegalizesMatrixTypes(TargetProgram* targetProgram)
 
     switch (targetProgram->getTargetReq()->getTarget())
     {
+    case CodeGenTarget::NX2Assembly:
     case CodeGenTarget::SPIRV:
     case CodeGenTarget::SPIRVAssembly:
     case CodeGenTarget::GLSL:
@@ -45,10 +46,10 @@ static bool shouldLegalizeMatrixType(TargetProgram* targetProgram, IRMatrixType*
 {
     SLANG_ASSERT(targetLegalizesMatrixTypes(targetProgram));
 
-    if (isCPUTargetViaLLVM(targetProgram->getTargetReq()))
+    if (isCPUTargetViaLLVM(targetProgram->getTargetReq()) ||
+        targetProgram->getTargetReq()->getTarget() == CodeGenTarget::NX2Assembly)
     {
-        // Always lower all matrices on LLVM; we'd need to break them up
-        // like this for data layout reasons anyway.
+        // LLVM and NX2 do not have a direct matrix representation.
         return true;
     }
 

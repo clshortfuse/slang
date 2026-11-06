@@ -2,12 +2,254 @@
 
 #include "core/slang-string-util.h"
 #include "slang-diagnostics.h"
+#include "slang-ir-dce.h"
+#include "slang-ir-inline.h"
 #include "slang-ir-insts.h"
+#include "slang-ir-sccp.h"
+#include "slang-ir-simplify-cfg.h"
 #include "slang-ir-util.h"
 #include "slang-parameter-binding.h"
 
 namespace Slang
 {
+// Return whether an instruction may be evaluated on both sides of an NX2 conditional.
+// For example, a floating-point multiply can be selected after evaluation, but a guarded
+// division, load, or call must remain in its original control-flow arm.
+static bool canSpeculateNX2ConditionalInst(IRInst* inst)
+{
+    auto type = inst->getDataType();
+    if (auto vector = as<IRVectorType>(type))
+        type = vector->getElementType();
+    return type && type->getOp() == kIROp_FloatType && inst->getOp() == kIROp_Mul;
+}
+
+// Return whether an instruction is an equality comparison that can select a constant integer mode.
+static bool isNX2IntegerComparison(IRInst* inst)
+{
+    if (inst->getOp() != kIROp_Eql || inst->getOperandCount() != 2)
+        return false;
+    auto type = inst->getOperand(0)->getDataType();
+    return type && type == inst->getOperand(1)->getDataType() &&
+           (type->getOp() == kIROp_IntType || type->getOp() == kIROp_UIntType);
+}
+
+bool inlineNX2LeafCalls(IRFunc* function, TargetProgram* targetProgram)
+{
+    bool changed = false;
+    for (;;)
+    {
+        IRCall* candidate = nullptr;
+        bool foldControlFlow = false;
+        for (auto block : function->getBlocks())
+        {
+            for (auto inst : block->getOrdinaryInsts())
+            {
+                auto call = as<IRCall>(inst);
+                auto function = call ? as<IRFunc>(call->getCallee()) : nullptr;
+                auto body = function ? function->getFirstBlock() : nullptr;
+                if (!body)
+                    continue;
+                bool straightLine = !body->getNextBlock() && as<IRReturn>(body->getTerminator());
+                if (as<IRGenericAsm>(body->getTerminator()))
+                    continue;
+                bool leaf = true;
+                for (auto calleeBlock : function->getBlocks())
+                {
+                    for (auto bodyInst : calleeBlock->getOrdinaryInsts())
+                    {
+                        if (auto innerCall = as<IRCall>(bodyInst))
+                        {
+                            auto innerFunc = as<IRFunc>(innerCall->getCallee());
+                            auto innerBlock = innerFunc ? innerFunc->getFirstBlock() : nullptr;
+                            if (!innerBlock || innerBlock->getNextBlock() ||
+                                !as<IRGenericAsm>(innerBlock->getTerminator()))
+                                leaf = false;
+                        }
+                    }
+                }
+                if (leaf)
+                {
+                    candidate = call;
+                    foldControlFlow = !straightLine;
+                    break;
+                }
+            }
+            if (candidate)
+                break;
+        }
+        if (!candidate || !inlineCall(candidate))
+            return changed;
+        changed = true;
+        if (foldControlFlow)
+        {
+            for (auto block : function->getBlocks())
+            {
+                if (auto conditional = as<IRIfElse>(block->getTerminator()))
+                {
+                    auto comparison = conditional->getCondition();
+                    if (isNX2IntegerComparison(comparison))
+                    {
+                        auto left = as<IRIntLit>(comparison->getOperand(0));
+                        auto right = as<IRIntLit>(comparison->getOperand(1));
+                        if (left && right)
+                            tryConstantFoldInst(function->getModule(), targetProgram, comparison);
+                    }
+                    if (auto condition = as<IRBoolLit>(conditional->getCondition()))
+                    {
+                        IRBuilder builder(conditional);
+                        builder.setInsertBefore(conditional);
+                        builder.emitBranch(
+                            condition->getValue() ? conditional->getTrueBlock()
+                                                  : conditional->getFalseBlock());
+                        conditional->removeAndDeallocate();
+                    }
+                }
+            }
+            eliminateDeadCode(function);
+            simplifyCFG(function, CFGSimplificationOptions{true, false});
+            eliminateDeadCode(function);
+            simplifyCFG(function, CFGSimplificationOptions::getFast());
+        }
+        else
+            simplifyCFG(function, CFGSimplificationOptions::getFast());
+    }
+}
+
+bool lowerNX2SpeculatableConditionals(IRFunc* function)
+{
+    bool changed = false;
+    for (auto block : function->getBlocks())
+    {
+        auto conditional = as<IRIfElse>(block->getTerminator());
+        if (!conditional)
+            continue;
+        auto trueBlock = conditional->getTrueBlock();
+        auto falseBlock = conditional->getFalseBlock();
+        auto afterBlock = conditional->getAfterBlock();
+        if (trueBlock == falseBlock || trueBlock->getFirstParam() || falseBlock->getFirstParam() ||
+            trueBlock->getPredecessors().getCount() != 1 ||
+            falseBlock->getPredecessors().getCount() != 1)
+            continue;
+        auto trueBranch = as<IRUnconditionalBranch>(trueBlock->getTerminator());
+        auto falseBranch = as<IRUnconditionalBranch>(falseBlock->getTerminator());
+        auto trueReturn = as<IRReturn>(trueBlock->getTerminator());
+        auto falseReturn = as<IRReturn>(falseBlock->getTerminator());
+        bool returns = trueReturn && falseReturn && trueReturn->getOperandCount() == 1 &&
+                       falseReturn->getOperandCount() == 1 &&
+                       trueReturn->getVal()->getDataType() == falseReturn->getVal()->getDataType();
+        bool branches = trueBranch && falseBranch && trueBlock != afterBlock &&
+                        falseBlock != afterBlock && !trueBlock->hasMoreThanOneUse() &&
+                        !falseBlock->hasMoreThanOneUse() &&
+                        trueBranch->getTargetBlock() == afterBlock &&
+                        falseBranch->getTargetBlock() == afterBlock &&
+                        trueBranch->getArgCount() == falseBranch->getArgCount();
+        if (!returns && !branches)
+            continue;
+        bool safe = true;
+        for (auto arm : {trueBlock, falseBlock})
+        {
+            for (auto inst : arm->getOrdinaryInsts())
+            {
+                if (inst != arm->getTerminator() && !canSpeculateNX2ConditionalInst(inst))
+                    safe = false;
+            }
+        }
+        if (!safe)
+            continue;
+        for (auto arm : {trueBlock, falseBlock})
+        {
+            for (auto inst = arm->getFirstOrdinaryInst(); inst != arm->getTerminator();)
+            {
+                auto next = inst->getNextInst();
+                inst->insertBefore(conditional);
+                inst = next;
+            }
+        }
+        List<IRInst*> arguments;
+        IRBuilder builder(conditional);
+        builder.setInsertBefore(conditional);
+        UInt count = returns ? 1 : trueBranch->getArgCount();
+        for (UInt i = 0; i < count; ++i)
+        {
+            IRInst* operands[] = {
+                conditional->getCondition(),
+                returns ? trueReturn->getVal() : trueBranch->getArg(i),
+                returns ? falseReturn->getVal() : falseBranch->getArg(i)};
+            arguments.add(
+                builder.emitIntrinsicInst(operands[1]->getDataType(), kIROp_Select, 3, operands));
+        }
+        if (returns)
+            builder.emitReturn(arguments[0]);
+        else
+            builder.emitBranch(afterBlock, arguments.getCount(), arguments.getBuffer());
+        conditional->removeAndDeallocate();
+        changed = true;
+    }
+    return changed;
+}
+
+bool lowerNX2MatrixVectorMul(IRFunc* entryPoint)
+{
+    List<IRCall*> calls;
+    for (auto block = entryPoint->getFirstBlock(); block; block = block->getNextBlock())
+    {
+        for (auto inst : block->getOrdinaryInsts())
+        {
+            auto call = as<IRCall>(inst);
+            auto function = call ? as<IRFunc>(call->getOperand(0)) : nullptr;
+            auto body = function ? function->getFirstBlock() : nullptr;
+            auto terminator = body ? body->getTerminator() : nullptr;
+            auto text = terminator && terminator->getOp() == kIROp_GenericAsm
+                            ? as<IRStringLit>(terminator->getOperand(0))
+                            : nullptr;
+            if (text && text->getStringSlice() == toSlice("nx2_matrix_vector_mul"))
+                calls.add(call);
+        }
+    }
+
+    bool changed = false;
+    for (auto call : calls)
+    {
+        if (call->getArgCount() != 2)
+            continue;
+        auto matrixType = as<IRMatrixType>(call->getArg(0)->getDataType());
+        auto vectorType = as<IRVectorType>(call->getArg(1)->getDataType());
+        auto resultType = as<IRVectorType>(call->getDataType());
+        if (!matrixType || !vectorType || !resultType ||
+            matrixType->getElementType()->getOp() != kIROp_FloatType)
+            continue;
+        auto rows = as<IRIntLit>(matrixType->getRowCount());
+        auto columns = as<IRIntLit>(matrixType->getColumnCount());
+        if (!rows || !columns || rows->getValue() < 1 || rows->getValue() > 4 ||
+            columns->getValue() < 1 || columns->getValue() > 4)
+            continue;
+
+        IRBuilder builder(call);
+        builder.setInsertBefore(call);
+        List<IRInst*> components;
+        for (IRIntegerValue row = 0; row < rows->getValue(); ++row)
+        {
+            auto matrixRow = builder.emitElementExtract(call->getArg(0), row);
+            IRInst* sum = builder.getFloatValue(matrixType->getElementType(), 0.0);
+            for (IRIntegerValue column = 0; column < columns->getValue(); ++column)
+            {
+                auto left = builder.emitElementExtract(matrixRow, column);
+                auto index = builder.getIntValue(column);
+                auto right =
+                    builder.emitSwizzle(matrixType->getElementType(), call->getArg(1), 1, &index);
+                auto product = builder.emitMul(matrixType->getElementType(), left, right);
+                sum = builder.emitAdd(matrixType->getElementType(), sum, product);
+            }
+            components.add(sum);
+        }
+        auto result = builder.emitMakeVector(resultType, components);
+        call->replaceUsesWith(result);
+        call->removeAndDeallocate();
+        changed = true;
+    }
+    return changed;
+}
+
 namespace
 {
 enum class NX2Interface
@@ -74,8 +316,9 @@ void scheduleNX2Lines(
     StringBuilder* output)
 {
     List<NX2ScheduledInstruction> program;
-    Index lastWrite[12];
-    List<Index> readers[12];
+    // Slot 12 represents the P0 predicate used by straight-line comparisons.
+    Index lastWrite[13];
+    List<Index> readers[13];
     for (auto& value : lastWrite)
         value = -1;
     for (const auto& line : lines)
@@ -127,11 +370,19 @@ void scheduleNX2Lines(
             writes.add(registers[0]);
             writes.add(registers[0] + 1);
         }
+        else if (text.startsWith(toSlice("FSETP.")) || text.startsWith(toSlice("ISETP.")))
+        {
+            for (UInt number : registers)
+                reads.add(number);
+            writes.add(12);
+        }
         else
         {
             writes.add(registers[0]);
             for (Index index = 1; index < registers.getCount(); ++index)
                 reads.add(registers[index]);
+            if (text.startsWith(toSlice("SEL ")) || text.startsWith(toSlice("FSEL ")))
+                reads.add(12);
         }
         Index index = program.getCount();
         for (UInt number : reads)
@@ -204,31 +455,25 @@ SlangResult allocateNX2Registers(
 {
     List<NX2NativeLine> lines;
     List<NX2LiveInterval> intervals;
-    Index current[255];
-    for (auto& interval : current)
-        interval = -1;
+    Dictionary<UInt, Index> current;
     bool valid = true;
     Index instruction = 0;
     auto read = [&](UInt number, Index position)
     {
-        if (number >= 255 || current[number] < 0)
+        auto currentInterval = current.tryGetValue(number);
+        if (!currentInterval)
         {
             valid = false;
             return Index(-1);
         }
-        intervals[current[number]].end = position;
-        return current[number];
+        intervals[*currentInterval].end = position;
+        return *currentInterval;
     };
     auto write = [&](UInt number, Index position)
     {
-        if (number >= 255)
-        {
-            valid = false;
-            return Index(-1);
-        }
         Index index = intervals.getCount();
         intervals.add({position, position, number, number < 11 ? number : UInt(255)});
-        current[number] = index;
+        current.set(number, index);
         return index;
     };
     for (Index start = 0; start < input.getLength();)
@@ -293,6 +538,17 @@ SlangResult allocateNX2Registers(
                 line.registers[0].interval = write(line.registers[0].number, instruction * 2 + 1);
                 write(line.registers[0].number + 1, instruction * 2 + 1);
             }
+        }
+        else if (text.startsWith(toSlice("FSETP.")) || text.startsWith(toSlice("ISETP.")))
+        {
+              if ((!text.startsWith(toSlice("FSETP.EQ.FTZ.AND P0, PT, ")) &&
+                  !text.startsWith(toSlice("FSETP.NEU.FTZ.AND P0, PT, ")) &&
+                  !text.startsWith(toSlice("FSETP.LT.FTZ.AND P0, PT, ")) &&
+                 !text.startsWith(toSlice("ISETP.NE.U32.AND P0, PT, "))) ||
+                !text.endsWith(toSlice(", PT;")))
+                valid = false;
+            for (auto& token : line.registers)
+                token.interval = read(token.number, instruction * 2);
         }
         else if (line.registers.getCount())
         {
@@ -367,6 +623,7 @@ struct NX2Operand
     {
         Register,
         Literal,
+        IntegerLiteral,
         ConstantBuffer
     };
     Kind kind = Kind::Register;
@@ -380,8 +637,9 @@ struct NX2Emitter
     DiagnosticSink* sink;
     StringBuilder* assembly;
     NX2Interface nativeInterface;
+    bool sceneTextureABI;
     bool failed = false;
-    bool sampled = false;
+    UInt sampledMask = 0;
     UInt nextRegister = 11;
     Dictionary<IRInst*, List<NX2Operand>> values;
     Dictionary<uint32_t, NX2Operand> literalRegisters;
@@ -471,6 +729,9 @@ struct NX2Emitter
         case NX2Operand::Kind::Literal:
             text << StringUtil::makeStringWithFormat("%.20e", double(value.literal));
             break;
+        case NX2Operand::Kind::IntegerLiteral:
+            text << StringUtil::makeStringWithFormat("0x%08x", value.index);
+            break;
         case NX2Operand::Kind::ConstantBuffer:
             text << "c[0x3][" << StringUtil::makeStringWithFormat("0x%x", value.index) << "]";
             break;
@@ -482,10 +743,13 @@ struct NX2Emitter
 
     void move(UInt destination, NX2Operand value)
     {
-        if (value.kind == NX2Operand::Kind::Literal)
+        if (value.kind == NX2Operand::Kind::Literal || value.kind == NX2Operand::Kind::IntegerLiteral)
         {
             uint32_t bits = 0;
-            ::memcpy(&bits, &value.literal, sizeof(bits));
+            if (value.kind == NX2Operand::Kind::IntegerLiteral)
+                bits = value.index;
+            else
+                ::memcpy(&bits, &value.literal, sizeof(bits));
             if (value.absolute)
                 bits &= 0x7fffffff;
             *assembly << "MOV R" << destination << ", "
@@ -499,10 +763,8 @@ struct NX2Emitter
             *assembly << "MOV R" << destination << ", " << operand(value) << ";\n";
     }
 
-    NX2Operand allocate(IRInst* inst)
+    NX2Operand allocate(IRInst*)
     {
-        if (nextRegister >= 255)
-            reject(inst);
         return {NX2Operand::Kind::Register, nextRegister++};
     }
 
@@ -609,18 +871,51 @@ struct NX2Emitter
             return result;
         }
         auto name = text->getStringSlice();
+        if ((name == toSlice("nx2_asfloat") || name == toSlice("nx2_asuint")) &&
+            inst->getArgCount() == 1)
+        {
+            auto operands = value(inst->getArg(0));
+            if (operands.getCount() < 1 || operands.getCount() > 4)
+            {
+                reject(inst);
+                return result;
+            }
+            for (auto operandValue : operands)
+            {
+                if (operandValue.absolute)
+                {
+                    reject(inst);
+                    return result;
+                }
+                if (name == toSlice("nx2_asfloat") &&
+                    operandValue.kind == NX2Operand::Kind::IntegerLiteral)
+                {
+                    float converted;
+                    ::memcpy(&converted, &operandValue.index, sizeof(converted));
+                    operandValue = {NX2Operand::Kind::Literal, 0, converted};
+                }
+                result.add(operandValue);
+            }
+            return result;
+        }
         if (name == toSlice("nx2_sample"))
         {
             auto texture = inst->getArgCount() == 3
                                ? as<IRTextureTypeBase>(inst->getArg(0)->getDataType())
                                : nullptr;
-            if (sampled || inst->getArgCount() != 3 || !texture ||
+            UInt slot = sceneTextureABI && inst->getArgCount() == 3 &&
+                                binding(inst->getArg(0), LayoutResourceKind::ShaderResource, 1) &&
+                                binding(inst->getArg(1), LayoutResourceKind::SamplerState, 1)
+                            ? 1
+                            : 0;
+            if ((sampledMask & (1u << slot)) || inst->getArgCount() != 3 || !texture ||
                 texture->getShape() != SLANG_TEXTURE_2D || texture->isMultisample() ||
                 texture->isShadow() || texture->isCombined() ||
                 texture->getAccess() != SLANG_RESOURCE_ACCESS_READ ||
                 width(texture->getElementType()) != 4 ||
-                !binding(inst->getArg(0), LayoutResourceKind::ShaderResource, 0) ||
-                !binding(inst->getArg(1), LayoutResourceKind::SamplerState, 0) ||
+                !binding(inst->getArg(0), LayoutResourceKind::ShaderResource, slot) ||
+                !binding(inst->getArg(1), LayoutResourceKind::SamplerState, slot) ||
+                (sceneTextureABI && nativeInterface != NX2Interface::PerspectiveTexture) ||
                 width(inst->getDataType()) != 4)
             {
                 reject(inst);
@@ -640,10 +935,20 @@ struct NX2Emitter
                 move(8, uv[0]);
                 move(9, uv[1]);
             }
-            sampled = true;
-            *assembly << "TEX.SCR.NODEP R2, R0, R8, R9, 0x2, 0x8, 2D;\n";
+            sampledMask |= 1u << slot;
+            *assembly << "TEX.SCR.NODEP R2, R0, R8, R9, 0x2, "
+                      << (slot == 0 ? "0x8" : "0xa") << ", 2D;\n";
             for (UInt lane = 0; lane < 4; ++lane)
-                result.add({NX2Operand::Kind::Register, lane});
+            {
+                NX2Operand sample{NX2Operand::Kind::Register, lane};
+                if (sceneTextureABI)
+                {
+                    auto saved = allocate(inst);
+                    move(saved.index, sample);
+                    sample = saved;
+                }
+                result.add(sample);
+            }
             return result;
         }
         if (inst->getArgCount() == 0)
@@ -652,6 +957,133 @@ struct NX2Emitter
             return result;
         }
         auto a = value(inst->getArg(0));
+        if (name == toSlice("nx2_any_scalar") && inst->getArgCount() == 1)
+        {
+            if (inst->getArg(0)->getDataType()->getOp() != kIROp_BoolType || a.getCount() != 1)
+                reject(inst);
+            else
+                result.add(a[0]);
+            return result;
+        }
+        if ((name == toSlice("nx2_isinf") || name == toSlice("nx2_isnan") ||
+             name == toSlice("nx2_isfinite")) &&
+            inst->getArgCount() == 1)
+        {
+            UInt count = width(inst->getArg(0)->getDataType());
+            if (!count || a.getCount() != Index(count))
+            {
+                reject(inst);
+                return result;
+            }
+            NX2Operand limit;
+            if (name != toSlice("nx2_isnan"))
+            {
+                uint32_t infinityBits = 0x7f800000;
+                float infinity;
+                ::memcpy(&infinity, &infinityBits, sizeof(infinity));
+                limit = reg(inst, {NX2Operand::Kind::Literal, 0, infinity});
+            }
+            for (auto source : a)
+            {
+                source = reg(inst, source);
+                if (name != toSlice("nx2_isnan"))
+                    source.absolute = true;
+                auto destination = allocate(inst);
+                auto opcode = name == toSlice("nx2_isinf")      ? "FSETP.EQ.FTZ.AND"
+                              : name == toSlice("nx2_isfinite") ? "FSETP.LT.FTZ.AND"
+                                                               : "FSETP.NEU.FTZ.AND";
+                *assembly << opcode << " P0, PT, " << operand(source) << ", "
+                          << operand(name == toSlice("nx2_isnan") ? source : limit)
+                          << ", PT;\nSEL " << operand(destination)
+                          << ", RZ, 0x1, !P0;\n";
+                result.add(destination);
+            }
+            return result;
+        }
+        if ((name == toSlice("nx2_all") || name == toSlice("nx2_any")) &&
+            inst->getArgCount() == 1)
+        {
+            auto type = as<IRVectorType>(inst->getArg(0)->getDataType());
+            if (!type || type->getElementType()->getOp() != kIROp_BoolType ||
+                inst->getDataType()->getOp() != kIROp_BoolType || a.getCount() < 1 ||
+                a.getCount() > 4)
+            {
+                reject(inst);
+                return result;
+            }
+            auto accumulated = reg(inst, a[0]);
+            for (Index lane = 1; lane < a.getCount(); ++lane)
+            {
+                auto next = reg(inst, a[lane]);
+                auto destination = allocate(inst);
+                *assembly << "LOP3.LUT " << operand(destination) << ", " << operand(accumulated)
+                          << ", " << operand(next) << ", RZ, "
+                          << (name == toSlice("nx2_all") ? "0xc0" : "0xfc") << ", !PT;\n";
+                accumulated = destination;
+            }
+            result.add(accumulated);
+            return result;
+        }
+        if (name == toSlice("nx2_pow") && inst->getArgCount() == 2)
+        {
+            auto b = value(inst->getArg(1));
+            UInt count = width(inst->getDataType());
+            if (!count || a.getCount() != Index(count) || b.getCount() != Index(count))
+            {
+                reject(inst);
+                return result;
+            }
+            for (UInt lane = 0; lane < count; ++lane)
+            {
+                auto base = reg(inst, a[lane]);
+                auto logarithm = allocate(inst);
+                *assembly << "MUFU.LG2 " << operand(logarithm) << ", " << operand(base) << ";\n";
+                auto exponent = binary(inst, "FMUL.FTZ", logarithm, b[lane]);
+                auto power = allocate(inst);
+                *assembly << "MUFU.EX2 " << operand(power) << ", " << operand(exponent) << ";\n";
+                result.add(power);
+            }
+            return result;
+        }
+        if ((name == toSlice("nx2_log10") || name == toSlice("nx2_log") ||
+             name == toSlice("nx2_exp")) &&
+            inst->getArgCount() == 1)
+        {
+            UInt count = width(inst->getDataType());
+            if (!count || a.getCount() != Index(count))
+            {
+                reject(inst);
+                return result;
+            }
+            for (auto source : a)
+            {
+                source = reg(inst, source);
+                if (name == toSlice("nx2_exp"))
+                {
+                    auto scaled = binary(
+                        inst,
+                        "FMUL.FTZ",
+                        source,
+                        {NX2Operand::Kind::Literal, 0, 1.4426950408889634074f});
+                    auto exponent = allocate(inst);
+                    *assembly << "MUFU.EX2 " << operand(exponent) << ", " << operand(scaled)
+                              << ";\n";
+                    result.add(exponent);
+                    continue;
+                }
+                auto logarithm = allocate(inst);
+                *assembly << "MUFU.LG2 " << operand(logarithm) << ", " << operand(source) << ";\n";
+                result.add(binary(
+                    inst,
+                    "FMUL.FTZ",
+                    logarithm,
+                    {NX2Operand::Kind::Literal,
+                     0,
+                     name == toSlice("nx2_log10") ? 0.30102999566398119521f
+                                                   : 0.69314718055994530942f}));
+            }
+            return result;
+        }
         if (name == toSlice("nx2_lerp") && inst->getArgCount() == 3)
         {
             auto b = value(inst->getArg(1));
@@ -750,7 +1182,10 @@ struct NX2Emitter
                 source.absolute = true;
                 result.add(source);
             }
-            else if (name == toSlice("nx2_log2") || name == toSlice("nx2_exp2"))
+            else if (
+                name == toSlice("nx2_log2") || name == toSlice("nx2_exp2") ||
+                name == toSlice("nx2_sqrt") || name == toSlice("nx2_rsqrt") ||
+                name == toSlice("nx2_rcp"))
             {
                 source = reg(inst, source);
                 auto destination = allocate(inst);
@@ -759,7 +1194,12 @@ struct NX2Emitter
                     if (canWriteOutputBank && (*locations)[lane] < 4)
                         destination.index = (*locations)[lane];
                 }
-                *assembly << (name == toSlice("nx2_log2") ? "MUFU.LG2 " : "MUFU.EX2 ")
+                auto opcode = name == toSlice("nx2_log2")  ? "MUFU.LG2 "
+                              : name == toSlice("nx2_exp2") ? "MUFU.EX2 "
+                              : name == toSlice("nx2_sqrt") ? "MUFU.SQRT "
+                              : name == toSlice("nx2_rsqrt") ? "MUFU.RSQ "
+                                                            : "MUFU.RCP ";
+                *assembly << opcode
                           << operand(destination) << ", " << operand(source) << ";\n";
                 result.add(destination);
             }
@@ -777,6 +1217,14 @@ struct NX2Emitter
         List<NX2Operand> result;
         if (auto literal = as<IRFloatLit>(inst))
             result.add({NX2Operand::Kind::Literal, 0, float(literal->getValue())});
+        else if (auto literal = as<IRIntLit>(inst))
+        {
+            auto type = literal->getDataType()->getOp();
+            if (type != kIROp_IntType && type != kIROp_UIntType)
+                reject(inst);
+            else
+                result.add({NX2Operand::Kind::IntegerLiteral, uint32_t(literal->getValue())});
+        }
         else if (auto swizzle = as<IRSwizzle>(inst))
         {
             auto base = value(swizzle->getBase());
@@ -798,6 +1246,77 @@ struct NX2Emitter
             result = load(inst);
         else if (auto invocation = as<IRCall>(inst))
             result = call(invocation);
+        else if (inst->getOp() == kIROp_Eql)
+        {
+            auto left = value(inst->getOperand(0));
+            auto right = value(inst->getOperand(1));
+            auto count = width(inst->getOperand(0)->getDataType());
+            if (!count || width(inst->getOperand(1)->getDataType()) != count ||
+                left.getCount() != Index(count) || right.getCount() != Index(count))
+                reject(inst);
+            if (!failed)
+            {
+                for (UInt lane = 0; lane < count; ++lane)
+                {
+                    auto a = reg(inst, left[lane]);
+                    auto b = reg(inst, right[lane]);
+                    auto destination = allocate(inst);
+                    *assembly << "FSETP.EQ.FTZ.AND P0, PT, " << operand(a) << ", " << operand(b)
+                              << ", PT;\nSEL " << operand(destination) << ", RZ, 0x1, !P0;\n";
+                    result.add(destination);
+                }
+            }
+        }
+        else if (auto select = as<IRSelect>(inst))
+        {
+            auto condition = value(select->getCondition());
+            auto ifTrue = value(select->getTrueResult());
+            auto ifFalse = value(select->getFalseResult());
+            auto count = width(inst->getDataType());
+            if (condition.getCount() != 1 || !count || ifTrue.getCount() != Index(count) ||
+                ifFalse.getCount() != Index(count))
+                reject(inst);
+            if (!failed)
+            {
+                auto predicate = reg(inst, condition[0]);
+                *assembly << "ISETP.NE.U32.AND P0, PT, " << operand(predicate) << ", RZ, PT;\n";
+                for (UInt lane = 0; lane < count; ++lane)
+                {
+                    auto a = reg(inst, ifTrue[lane]);
+                    auto b = reg(inst, ifFalse[lane]);
+                    auto destination = allocate(inst);
+                    *assembly << "SEL " << operand(destination) << ", " << operand(a) << ", "
+                              << operand(b) << ", P0;\n";
+                    result.add(destination);
+                }
+            }
+        }
+        else if (inst->getOp() == kIROp_BitAnd || inst->getOp() == kIROp_BitOr)
+        {
+            auto left = value(inst->getOperand(0));
+            auto right = value(inst->getOperand(1));
+            auto type = inst->getDataType();
+            auto vector = as<IRVectorType>(type);
+            auto element = vector ? vector->getElementType() : type;
+            Index count = vector ? Index(getIntVal(vector->getElementCount())) : 1;
+            if ((element->getOp() != kIROp_UIntType && element->getOp() != kIROp_IntType) ||
+                count < 1 || count > 4 || (left.getCount() != 1 && left.getCount() != count) ||
+                (right.getCount() != 1 && right.getCount() != count))
+                reject(inst);
+            if (!failed)
+            {
+                for (Index lane = 0; lane < count; ++lane)
+                {
+                    auto a = reg(inst, left[left.getCount() == 1 ? 0 : lane]);
+                    auto b = reg(inst, right[right.getCount() == 1 ? 0 : lane]);
+                    auto destination = allocate(inst);
+                    *assembly << "LOP3.LUT " << operand(destination) << ", " << operand(a)
+                              << ", " << operand(b) << ", RZ, "
+                              << (inst->getOp() == kIROp_BitAnd ? "0xc0" : "0xfc") << ", !PT;\n";
+                    result.add(destination);
+                }
+            }
+        }
         else if (
             inst->getOp() == kIROp_Mul || inst->getOp() == kIROp_Add || inst->getOp() == kIROp_Div)
         {
@@ -1011,12 +1530,12 @@ struct NX2Emitter
             switch (inst->getOp())
             {
             case kIROp_Return:
+            case kIROp_IntLit:
             case kIROp_FieldAddress:
             case kIROp_GetElementPtr:
             case kIROp_MakeVector:
             case kIROp_Swizzle:
             case kIROp_Mul:
-            case kIROp_Add:
             case kIROp_Div:
             case kIROp_Load:
                 break;
@@ -1071,6 +1590,7 @@ struct NX2Emitter
 SlangResult emitNX2Assembly(
     IRFunc* entryPoint,
     DiagnosticSink* sink,
+    bool sceneTextureABI,
     StringBuilder* assembly)
 {
     StringBuilder virtualAssembly;
@@ -1089,7 +1609,7 @@ SlangResult emitNX2Assembly(
             }
         }
     }
-    NX2Emitter emitter{sink, &virtualAssembly, nativeInterface};
+    NX2Emitter emitter{sink, &virtualAssembly, nativeInterface, sceneTextureABI};
     SLANG_RETURN_ON_FAIL(emitter.emit(entryPoint));
     return allocateNX2Registers(
         virtualAssembly.toString(), sink, emitter.width(entryPoint->getResultType()), assembly);

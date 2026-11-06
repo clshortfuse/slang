@@ -107,6 +107,9 @@ def cuda : target + textualTarget;
 /// [Target]
 def nx2 : target;
 
+/// Selects the experimental OOT ordinary-scene two-texture NX2 binding contract.
+def nx2_oot_scene_abi : nx2;
+
 /// Represents the Metal programming language code generation target.
 /// [Target]
 def metal : target + textualTarget;
@@ -2436,6 +2439,9 @@ alias texture_sm_4_0_fragment = texture_sm_4_0;
 /// PQ arithmetic on existing targets or experimental native NX2.
 /// [Compound]
 alias nx2_pq_math = cpp_cuda_glsl_hlsl_metal_spirv_wgsl_llvm + sm_4_0_version | nx2;
+/// General math on existing targets or experimental native NX2.
+/// [Compound]
+alias nx2_general_math = cpp_cuda_glsl_hlsl_metal_spirv_wgsl_llvm | nx2;
 
 /// Basic texture sampling on existing targets or experimental NX2 fragments.
 /// [Compound]
@@ -2527,6 +2533,9 @@ alias texturefootprintclamp = texturefootprint + GL_ARB_sparse_texture_clamp;
 /// Capabilities required to use sm_4_0 features apart of GL_ARB_gpu_shader5
 /// [Compound]
 alias shader5_sm_4_0 = GL_ARB_gpu_shader5 | sm_4_0_version;
+/// Bit reinterpretation on existing targets or experimental native NX2.
+/// [Compound]
+alias nx2_bitcast_math = cpp_cuda_glsl_hlsl_metal_spirv_wgsl_llvm + shader5_sm_4_0 | nx2;
 /// Capabilities required to use sm_5_0 features apart of GL_ARB_gpu_shader5
 /// [Compound]
 alias shader5_sm_5_0 = GL_ARB_gpu_shader5 | sm_5_0_version;
