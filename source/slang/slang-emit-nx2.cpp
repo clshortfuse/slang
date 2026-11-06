@@ -5,6 +5,7 @@
 #include "slang-ir-dce.h"
 #include "slang-ir-inline.h"
 #include "slang-ir-insts.h"
+#include "slang-ir-restructure.h"
 #include "slang-ir-sccp.h"
 #include "slang-ir-simplify-cfg.h"
 #include "slang-ir-util.h"
@@ -188,7 +189,134 @@ bool lowerNX2SpeculatableConditionals(IRFunc* function)
     return changed;
 }
 
-bool lowerNX2MatrixVectorMul(IRFunc* entryPoint)
+bool lowerNX2AcyclicLoops(IRFunc* function)
+{
+    List<IRBlock*> blocks;
+    List<List<Index>> successors;
+    Dictionary<IRBlock*, Index> indices;
+    auto first = function->getFirstBlock();
+    if (!first)
+        return false;
+    blocks.add(first);
+    indices.add(first, 0);
+    bool hasLoop = false;
+    Index returnCount = 0;
+    for (Index index = 0; index < blocks.getCount(); ++index)
+    {
+        auto terminator = blocks[index]->getTerminator();
+        if (!terminator)
+            return false;
+        List<IRBlock*> targets;
+        if (auto conditional = as<IRIfElse>(terminator))
+        {
+            targets.add(conditional->getTrueBlock());
+            targets.add(conditional->getFalseBlock());
+        }
+        else if (auto branch = as<IRUnconditionalBranch>(terminator))
+        {
+            if (branch->getArgCount())
+                return false;
+            targets.add(branch->getTargetBlock());
+            hasLoop |= as<IRLoop>(terminator) != nullptr;
+        }
+        else if (as<IRReturn>(terminator))
+            ++returnCount;
+        else
+            return false;
+        List<Index> edges;
+        for (auto target : targets)
+        {
+            auto found = indices.tryGetValue(target);
+            if (!found)
+            {
+                Index next = blocks.getCount();
+                blocks.add(target);
+                indices.add(target, next);
+                edges.add(next);
+            }
+            else
+                edges.add(*found);
+        }
+        successors.add(_Move(edges));
+    }
+    if (!hasLoop || returnCount != 1)
+        return false;
+
+    List<Index> incoming;
+    incoming.setCount(blocks.getCount());
+    for (auto& count : incoming)
+        count = 0;
+    for (const auto& edges : successors)
+        for (Index target : edges)
+            ++incoming[target];
+    List<Index> order;
+    for (Index index = 0; index < incoming.getCount(); ++index)
+        if (!incoming[index])
+            order.add(index);
+    for (Index position = 0; position < order.getCount(); ++position)
+    {
+        for (Index target : successors[order[position]])
+            if (--incoming[target] == 0)
+                order.add(target);
+    }
+    if (order.getCount() != blocks.getCount())
+        return false;
+
+    List<HashSet<Index>> postdominators;
+    postdominators.setCount(blocks.getCount());
+    for (Index position = order.getCount(); position-- > 0;)
+    {
+        Index index = order[position];
+        auto& set = postdominators[index];
+        set.add(index);
+        if (successors[index].getCount())
+        {
+            for (Index candidate : postdominators[successors[index][0]])
+            {
+                bool common = true;
+                for (Index target : successors[index])
+                    common &= postdominators[target].contains(candidate);
+                if (common)
+                    set.add(candidate);
+            }
+        }
+    }
+    List<IRBlock*> joins;
+    joins.setCount(blocks.getCount());
+    for (Index index = 0; index < blocks.getCount(); ++index)
+    {
+        joins[index] = nullptr;
+        if (!as<IRIfElse>(blocks[index]->getTerminator()))
+            continue;
+        Index closest = -1;
+        for (Index candidate : postdominators[index])
+        {
+            if (candidate != index && (closest < 0 || postdominators[candidate].getCount() >
+                                                          postdominators[closest].getCount()))
+                closest = candidate;
+        }
+        if (closest < 0)
+            return false;
+        joins[index] = blocks[closest];
+    }
+    for (Index index = 0; index < blocks.getCount(); ++index)
+    {
+        auto terminator = blocks[index]->getTerminator();
+        if (auto conditional = as<IRIfElse>(terminator))
+            conditional->afterBlock.set(joins[index]);
+        else if (auto loop = as<IRLoop>(terminator))
+        {
+            IRBuilder builder(loop);
+            builder.setInsertBefore(loop);
+            builder.emitBranch(loop->getTargetBlock());
+            loop->removeAndDeallocate();
+        }
+    }
+    function->getModule()->invalidateAnalysisForInst(function);
+    return true;
+}
+
+bool lowerNX2MatrixOperations(IRFunc* entryPoint)
 {
     List<IRCall*> calls;
     for (auto block = entryPoint->getFirstBlock(); block; block = block->getNextBlock())
@@ -202,7 +330,9 @@ bool lowerNX2MatrixVectorMul(IRFunc* entryPoint)
             auto text = terminator && terminator->getOp() == kIROp_GenericAsm
                             ? as<IRStringLit>(terminator->getOperand(0))
                             : nullptr;
-            if (text && text->getStringSlice() == toSlice("nx2_matrix_vector_mul"))
+            if (text && (text->getStringSlice() == toSlice("nx2_matrix_vector_mul") ||
+                         text->getStringSlice() == toSlice("nx2_matrix_matrix_mul") ||
+                         text->getStringSlice() == toSlice("nx2_matrix_transpose")))
                 calls.add(call);
         }
     }
@@ -210,9 +340,76 @@ bool lowerNX2MatrixVectorMul(IRFunc* entryPoint)
     bool changed = false;
     for (auto call : calls)
     {
+        if (call->getArgCount() == 1)
+        {
+            auto inputType = as<IRMatrixType>(call->getArg(0)->getDataType());
+            auto resultType = as<IRMatrixType>(call->getDataType());
+            auto rows = inputType ? as<IRIntLit>(inputType->getRowCount()) : nullptr;
+            auto columns = inputType ? as<IRIntLit>(inputType->getColumnCount()) : nullptr;
+            if (!inputType || !resultType ||
+                inputType->getElementType()->getOp() != kIROp_FloatType || !rows || !columns ||
+                rows->getValue() < 1 || rows->getValue() > 4 || columns->getValue() < 1 ||
+                columns->getValue() > 4)
+                continue;
+            IRBuilder builder(call);
+            builder.setInsertBefore(call);
+            List<IRInst*> elements;
+            for (IRIntegerValue row = 0; row < columns->getValue(); ++row)
+                for (IRIntegerValue column = 0; column < rows->getValue(); ++column)
+                    elements.add(builder.emitElementExtract(
+                        builder.emitElementExtract(call->getArg(0), column),
+                        row));
+            auto result =
+                builder.emitMakeMatrix(resultType, UInt(elements.getCount()), elements.getBuffer());
+            call->replaceUsesWith(result);
+            call->removeAndDeallocate();
+            changed = true;
+            continue;
+        }
         if (call->getArgCount() != 2)
             continue;
         auto matrixType = as<IRMatrixType>(call->getArg(0)->getDataType());
+        auto rightMatrixType = as<IRMatrixType>(call->getArg(1)->getDataType());
+        auto resultMatrixType = as<IRMatrixType>(call->getDataType());
+        if (matrixType && rightMatrixType && resultMatrixType &&
+            matrixType->getElementType()->getOp() == kIROp_FloatType)
+        {
+            auto rows = as<IRIntLit>(matrixType->getRowCount());
+            auto inner = as<IRIntLit>(matrixType->getColumnCount());
+            auto columns = as<IRIntLit>(rightMatrixType->getColumnCount());
+            if (!rows || !inner || !columns || rows->getValue() < 1 || rows->getValue() > 4 ||
+                inner->getValue() < 1 || inner->getValue() > 4 || columns->getValue() < 1 ||
+                columns->getValue() > 4)
+                continue;
+            IRBuilder builder(call);
+            builder.setInsertBefore(call);
+            List<IRInst*> components;
+            for (IRIntegerValue row = 0; row < rows->getValue(); ++row)
+            {
+                auto leftRow = builder.emitElementExtract(call->getArg(0), row);
+                for (IRIntegerValue column = 0; column < columns->getValue(); ++column)
+                {
+                    IRInst* sum = builder.getFloatValue(matrixType->getElementType(), 0.0);
+                    for (IRIntegerValue index = 0; index < inner->getValue(); ++index)
+                    {
+                        auto left = builder.emitElementExtract(leftRow, index);
+                        auto rightRow = builder.emitElementExtract(call->getArg(1), index);
+                        auto right = builder.emitElementExtract(rightRow, column);
+                        auto product = builder.emitMul(matrixType->getElementType(), left, right);
+                        sum = builder.emitAdd(matrixType->getElementType(), sum, product);
+                    }
+                    components.add(sum);
+                }
+            }
+            auto result = builder.emitMakeMatrix(
+                resultMatrixType,
+                UInt(components.getCount()),
+                components.getBuffer());
+            call->replaceUsesWith(result);
+            call->removeAndDeallocate();
+            changed = true;
+            continue;
+        }
         auto vectorType = as<IRVectorType>(call->getArg(1)->getDataType());
         auto resultType = as<IRVectorType>(call->getDataType());
         if (!matrixType || !vectorType || !resultType ||
@@ -250,8 +447,96 @@ bool lowerNX2MatrixVectorMul(IRFunc* entryPoint)
     return changed;
 }
 
+// Split mutable struct locals into field locals, preserving whole-value loads and stores.
+// For example, writes to `state.color` and `state.value` remain independent across branches.
+bool lowerNX2LocalStructs(IRFunc* entryPoint)
+{
+    List<IRVar*> candidates;
+    for (auto block : entryPoint->getBlocks())
+        for (auto inst : block->getOrdinaryInsts())
+            if (auto var = as<IRVar>(inst))
+                if (auto pointer = as<IRPtrTypeBase>(var->getDataType()))
+                    if (as<IRStructType>(pointer->getValueType()))
+                        candidates.add(var);
+
+    bool changed = false;
+    for (Index candidateIndex = 0; candidateIndex < candidates.getCount(); ++candidateIndex)
+    {
+        auto var = candidates[candidateIndex];
+        auto structType = as<IRStructType>(as<IRPtrTypeBase>(var->getDataType())->getValueType());
+        bool supported = true;
+        for (auto use = var->firstUse; use; use = use->nextUse)
+        {
+            auto user = use->getUser();
+            if (auto address = as<IRFieldAddress>(user))
+                supported &= address->getBase() == var;
+            else if (auto load = as<IRLoad>(user))
+                supported &= load->getPtr() == var;
+            else if (auto store = as<IRStore>(user))
+                supported &= store->getPtr() == var;
+            else
+                supported = false;
+        }
+        if (!supported)
+            continue;
+
+        IRBuilder builder(var);
+        builder.setInsertBefore(var);
+        Dictionary<IRInst*, IRVar*> fields;
+        for (auto field : structType->getFields())
+        {
+            auto fieldVar = builder.emitVar(field->getFieldType());
+            fields.add(field->getKey(), fieldVar);
+            if (as<IRStructType>(field->getFieldType()))
+                candidates.add(fieldVar);
+        }
+        while (var->firstUse)
+        {
+            auto user = var->firstUse->getUser();
+            builder.setInsertBefore(user);
+            if (auto address = as<IRFieldAddress>(user))
+            {
+                auto field = fields.tryGetValue(address->getField());
+                SLANG_RELEASE_ASSERT(field);
+                address->replaceUsesWith(*field);
+                address->removeAndDeallocate();
+            }
+            else if (auto load = as<IRLoad>(user))
+            {
+                List<IRInst*> values;
+                for (auto field : structType->getFields())
+                    values.add(builder.emitLoad(fields[field->getKey()]));
+                auto value = builder.emitMakeStruct(structType, values);
+                load->replaceUsesWith(value);
+                load->removeAndDeallocate();
+            }
+            else
+            {
+                auto store = cast<IRStore>(user);
+                for (auto field : structType->getFields())
+                    builder.emitStore(
+                        fields[field->getKey()],
+                        builder.emitFieldExtract(
+                            field->getFieldType(),
+                            store->getVal(),
+                            field->getKey()));
+                store->removeAndDeallocate();
+            }
+        }
+        var->removeAndDeallocate();
+        changed = true;
+    }
+    return changed;
+}
+
 namespace
 {
+// The pinned nested-control-flow reference uses registers through R124. This
+// smaller allocation budget is a backend limit, not a hardware maximum.
+constexpr UInt kNX2AllocatableRegisterCount = 125;
+// The pinned deep-control-flow capture uses nested barriers B0 through B7.
+constexpr UInt kNX2ReconvergenceBarrierCount = 8;
+
 enum class NX2Interface
 {
     PerspectiveTexture,
@@ -270,8 +555,8 @@ Int getNX2VaryingSlot(IRParam* param)
     splitNameAndIndex(decoration->getSemanticName(), name, digits);
     Int index = decoration->getEffectiveSemanticIndex();
     if (name != toSlice("TEXCOORD") ||
-        (digits.getLength() && SLANG_FAILED(StringUtil::parseInt(digits, index))) ||
-        index < 0 || index >= 32)
+        (digits.getLength() && SLANG_FAILED(StringUtil::parseInt(digits, index))) || index < 0 ||
+        index >= 32)
         return -1;
     return index;
 }
@@ -299,6 +584,191 @@ struct NX2NativeLine
     List<NX2RegisterToken> registers;
 };
 
+struct NX2ControlFlowLine
+{
+    NX2NativeLine native;
+    List<Index> successors;
+    HashSet<UInt> reads;
+    HashSet<UInt> writes;
+    HashSet<UInt> liveIn;
+    HashSet<UInt> liveOut;
+};
+
+// Allocate conditional-path temporaries from CFG liveness without reordering instructions.
+// Values assigned in both arms, for example, retain one register at their merge.
+SlangResult allocateNX2ConditionalRegisters(
+    const String& input,
+    UInt nextRegister,
+    UInt outputCount,
+    DiagnosticSink* sink,
+    StringBuilder* output)
+{
+    List<NX2ControlFlowLine> lines;
+    Dictionary<String, Index> labels;
+    for (Index start = 0; start < input.getLength();)
+    {
+        Index end = start;
+        while (end < input.getLength() && input[end] != '\n')
+            ++end;
+        NX2ControlFlowLine line;
+        line.native.text = input.subString(start, end - start);
+        start = end + 1;
+        auto text = line.native.text.getUnownedSlice();
+        if (text.endsWith(toSlice(":")))
+            labels.add(line.native.text.subString(0, text.getLength() - 1), lines.getCount());
+        if (!text.startsWith(toSlice("//")))
+        {
+            for (Index offset = 0; offset < text.getLength(); ++offset)
+            {
+                if (text[offset] != 'R' || offset + 1 == text.getLength() ||
+                    text[offset + 1] < '0' || text[offset + 1] > '9')
+                    continue;
+                Index last = offset + 1;
+                UInt number = 0;
+                while (last < text.getLength() && text[last] >= '0' && text[last] <= '9')
+                    number = number * 10 + UInt(text[last++] - '0');
+                line.native.registers.add({offset, last, number});
+                offset = last - 1;
+            }
+        }
+        bool predicate = text.startsWith(toSlice("FSETP.")) || text.startsWith(toSlice("ISETP."));
+        bool texture = text.startsWith(toSlice("TEX.SCR.NODEP "));
+        if (texture)
+        {
+            if (line.native.registers.getCount() != 4 || line.native.registers[0].number != 2 ||
+                line.native.registers[1].number != 0 || line.native.registers[2].number != 8 ||
+                line.native.registers[3].number != 9)
+            {
+                sink->diagnose(
+                    Diagnostics::Unimplemented{
+                        .feature =
+                            "NX2 conditional texture operands require the fixed register banks",
+                        .location = SourceLoc()});
+                return SLANG_FAIL;
+            }
+            line.reads.add(8);
+            line.reads.add(9);
+            for (UInt number = 0; number < 4; ++number)
+                line.writes.add(number);
+        }
+        else if (text == toSlice("EXIT;"))
+        {
+            for (UInt number = 0; number < outputCount; ++number)
+                line.reads.add(number);
+        }
+        else
+        {
+            for (Index index = 0; index < line.native.registers.getCount(); ++index)
+            {
+                UInt number = line.native.registers[index].number;
+                if (!predicate && index == 0)
+                    line.writes.add(number);
+                else
+                    line.reads.add(number);
+            }
+        }
+        lines.add(_Move(line));
+    }
+    for (Index index = 0; index < lines.getCount(); ++index)
+    {
+        auto text = lines[index].native.text.getUnownedSlice();
+        bool unconditional = text.startsWith(toSlice("BRA "));
+        bool conditionalNot = text.startsWith(toSlice("@!P0 BRA "));
+        bool conditional = conditionalNot || text.startsWith(toSlice("@P0 BRA "));
+        if (unconditional || conditional)
+        {
+            Index prefix = unconditional ? 4 : conditionalNot ? 9 : 8;
+            String label =
+                lines[index].native.text.subString(prefix, text.getLength() - prefix - 1);
+            auto target = labels.tryGetValue(label);
+            if (!target)
+            {
+                sink->diagnose(
+                    Diagnostics::Unimplemented{
+                        .feature = "NX2 conditional branch target is undefined",
+                        .location = SourceLoc()});
+                return SLANG_FAIL;
+            }
+            lines[index].successors.add(*target);
+        }
+        if (!unconditional && text != toSlice("EXIT;") && index + 1 < lines.getCount())
+            lines[index].successors.add(index + 1);
+    }
+    bool changed = true;
+    while (changed)
+    {
+        changed = false;
+        for (Index index = lines.getCount(); index-- > 0;)
+        {
+            auto& line = lines[index];
+            for (Index successor : line.successors)
+                for (UInt number : lines[successor].liveIn)
+                    changed |= line.liveOut.add(number);
+            for (UInt number : line.liveOut)
+                if (!line.writes.contains(number))
+                    changed |= line.liveIn.add(number);
+            for (UInt number : line.reads)
+                changed |= line.liveIn.add(number);
+        }
+    }
+    List<HashSet<UInt>> interference;
+    interference.setCount(nextRegister);
+    for (const auto& line : lines)
+    {
+        for (UInt destination : line.writes)
+        {
+            for (UInt other : line.liveOut)
+            {
+                if (destination != other)
+                {
+                    interference[destination].add(other);
+                    interference[other].add(destination);
+                }
+            }
+        }
+    }
+    List<UInt> physical;
+    physical.setCount(nextRegister);
+    for (UInt number = 0; number < nextRegister; ++number)
+        physical[number] = number < 11 ? number : UInt(255);
+    for (UInt number = 11; number < nextRegister; ++number)
+    {
+        for (UInt candidate = 0; candidate < kNX2AllocatableRegisterCount; ++candidate)
+        {
+            bool available = true;
+            for (UInt other : interference[number])
+                if (physical[other] == candidate)
+                    available = false;
+            if (available)
+            {
+                physical[number] = candidate;
+                break;
+            }
+        }
+        if (physical[number] == 255)
+        {
+            sink->diagnose(
+                Diagnostics::Unimplemented{
+                    .feature = "NX2 conditional allocation exceeds 125 registers",
+                    .location = SourceLoc()});
+            return SLANG_FAIL;
+        }
+    }
+    for (const auto& line : lines)
+    {
+        Index offset = 0;
+        for (const auto& token : line.native.registers)
+        {
+            *output << line.native.text.subString(offset, token.start - offset) << "R"
+                    << physical[token.number];
+            offset = token.end;
+        }
+        *output << line.native.text.subString(offset, line.native.text.getLength() - offset)
+                << "\n";
+    }
+    return SLANG_OK;
+}
+
 struct NX2ScheduledInstruction
 {
     String text;
@@ -316,9 +786,9 @@ void scheduleNX2Lines(
     StringBuilder* output)
 {
     List<NX2ScheduledInstruction> program;
-    // Slot 12 represents the P0 predicate used by straight-line comparisons.
-    Index lastWrite[13];
-    List<Index> readers[13];
+    // The final slot represents P0 rather than a physical register.
+    Index lastWrite[kNX2AllocatableRegisterCount + 1];
+    List<Index> readers[kNX2AllocatableRegisterCount + 1];
     for (auto& value : lastWrite)
         value = -1;
     for (const auto& line : lines)
@@ -374,7 +844,7 @@ void scheduleNX2Lines(
         {
             for (UInt number : registers)
                 reads.add(number);
-            writes.add(12);
+            writes.add(kNX2AllocatableRegisterCount);
         }
         else
         {
@@ -382,7 +852,7 @@ void scheduleNX2Lines(
             for (Index index = 1; index < registers.getCount(); ++index)
                 reads.add(registers[index]);
             if (text.startsWith(toSlice("SEL ")) || text.startsWith(toSlice("FSEL ")))
-                reads.add(12);
+                reads.add(kNX2AllocatableRegisterCount);
         }
         Index index = program.getCount();
         for (UInt number : reads)
@@ -541,9 +1011,11 @@ SlangResult allocateNX2Registers(
         }
         else if (text.startsWith(toSlice("FSETP.")) || text.startsWith(toSlice("ISETP.")))
         {
-              if ((!text.startsWith(toSlice("FSETP.EQ.FTZ.AND P0, PT, ")) &&
-                  !text.startsWith(toSlice("FSETP.NEU.FTZ.AND P0, PT, ")) &&
-                  !text.startsWith(toSlice("FSETP.LT.FTZ.AND P0, PT, ")) &&
+            if ((!text.startsWith(toSlice("FSETP.EQ.FTZ.AND P0, PT, ")) &&
+                 !text.startsWith(toSlice("FSETP.NEU.FTZ.AND P0, PT, ")) &&
+                 !text.startsWith(toSlice("FSETP.LT.FTZ.AND P0, PT, ")) &&
+                 !text.startsWith(toSlice("FSETP.GT.FTZ.AND P0, PT, ")) &&
+                 !text.startsWith(toSlice("FSETP.GE.FTZ.AND P0, PT, ")) &&
                  !text.startsWith(toSlice("ISETP.NE.U32.AND P0, PT, "))) ||
                 !text.endsWith(toSlice(", PT;")))
                 valid = false;
@@ -570,16 +1042,16 @@ SlangResult allocateNX2Registers(
     {
         auto& interval = intervals[index];
         List<UInt> candidates;
-        if (interval.physicalRegister < 12)
+        if (interval.physicalRegister < kNX2AllocatableRegisterCount)
             candidates.add(interval.physicalRegister);
         else
         {
             UInt preferred = interval.preferredSource >= 0
                                  ? intervals[interval.preferredSource].physicalRegister
                                  : 255;
-            if (preferred < 12)
+            if (preferred < kNX2AllocatableRegisterCount)
                 candidates.add(preferred);
-            for (UInt number = 0; number < 12; ++number)
+            for (UInt number = 0; number < kNX2AllocatableRegisterCount; ++number)
             {
                 if (number != preferred)
                     candidates.add(number);
@@ -609,7 +1081,7 @@ SlangResult allocateNX2Registers(
         sink->diagnose(
             Diagnostics::Unimplemented{
                 .feature = "NX2 native register allocation requires defined inputs and at most "
-                           "twelve registers",
+                           "125 registers",
                 .location = SourceLoc()});
         return SLANG_FAIL;
     }
@@ -632,6 +1104,13 @@ struct NX2Operand
     bool absolute = false;
 };
 
+struct NX2ActiveLoop
+{
+    LoopRegion* region;
+    UInt depth;
+    UInt label;
+};
+
 struct NX2Emitter
 {
     DiagnosticSink* sink;
@@ -644,6 +1123,12 @@ struct NX2Emitter
     Dictionary<IRInst*, List<NX2Operand>> values;
     Dictionary<uint32_t, NX2Operand> literalRegisters;
     Dictionary<IRInst*, List<UInt>> outputLocations;
+    Dictionary<IRInst*, List<NX2Operand>> localVariables;
+    HashSet<IRBlock*> emittedBlocks;
+    UInt nextLabel = 0;
+    IRFunc* currentFunction = nullptr;
+    List<NX2ActiveLoop> activeLoops;
+    bool inConditionalEntryBlock = false;
 
     void markOutput(IRInst* inst, UInt lane, UInt location)
     {
@@ -743,7 +1228,8 @@ struct NX2Emitter
 
     void move(UInt destination, NX2Operand value)
     {
-        if (value.kind == NX2Operand::Kind::Literal || value.kind == NX2Operand::Kind::IntegerLiteral)
+        if (value.kind == NX2Operand::Kind::Literal ||
+            value.kind == NX2Operand::Kind::IntegerLiteral)
         {
             uint32_t bits = 0;
             if (value.kind == NX2Operand::Kind::IntegerLiteral)
@@ -763,10 +1249,7 @@ struct NX2Emitter
             *assembly << "MOV R" << destination << ", " << operand(value) << ";\n";
     }
 
-    NX2Operand allocate(IRInst*)
-    {
-        return {NX2Operand::Kind::Register, nextRegister++};
-    }
+    NX2Operand allocate(IRInst*) { return {NX2Operand::Kind::Register, nextRegister++}; }
 
     NX2Operand reg(IRInst* inst, NX2Operand value)
     {
@@ -808,6 +1291,16 @@ struct NX2Emitter
     {
         List<NX2Operand> result;
         auto pointer = inst->getOperand(0);
+        if (auto local = localVariables.tryGetValue(pointer))
+        {
+            for (auto source : *local)
+            {
+                auto destination = allocate(inst);
+                move(destination.index, source);
+                result.add(destination);
+            }
+            return result;
+        }
         if (pointer->getOp() != kIROp_GetElementPtr)
         {
             reject(inst);
@@ -924,24 +1417,24 @@ struct NX2Emitter
             auto uv = value(inst->getArg(2));
             if (uv.getCount() != 2 || uv[0].kind != NX2Operand::Kind::Register ||
                 uv[1].kind != NX2Operand::Kind::Register ||
-                (nativeInterface == NX2Interface::PerspectiveTexture &&
+                (nativeInterface == NX2Interface::PerspectiveTexture && !inConditionalEntryBlock &&
                  (uv[0].index != 8 || uv[1].index != 9)))
             {
                 reject(inst);
                 return result;
             }
-            if (nativeInterface == NX2Interface::ScreenTexture)
+            if (nativeInterface == NX2Interface::ScreenTexture || inConditionalEntryBlock)
             {
                 move(8, uv[0]);
                 move(9, uv[1]);
             }
             sampledMask |= 1u << slot;
-            *assembly << "TEX.SCR.NODEP R2, R0, R8, R9, 0x2, "
-                      << (slot == 0 ? "0x8" : "0xa") << ", 2D;\n";
+            *assembly << "TEX.SCR.NODEP R2, R0, R8, R9, 0x2, " << (slot == 0 ? "0x8" : "0xa")
+                      << ", 2D;\n";
             for (UInt lane = 0; lane < 4; ++lane)
             {
                 NX2Operand sample{NX2Operand::Kind::Register, lane};
-                if (sceneTextureABI)
+                if (sceneTextureABI || inConditionalEntryBlock)
                 {
                     auto saved = allocate(inst);
                     move(saved.index, sample);
@@ -991,17 +1484,15 @@ struct NX2Emitter
                 auto destination = allocate(inst);
                 auto opcode = name == toSlice("nx2_isinf")      ? "FSETP.EQ.FTZ.AND"
                               : name == toSlice("nx2_isfinite") ? "FSETP.LT.FTZ.AND"
-                                                               : "FSETP.NEU.FTZ.AND";
+                                                                : "FSETP.NEU.FTZ.AND";
                 *assembly << opcode << " P0, PT, " << operand(source) << ", "
-                          << operand(name == toSlice("nx2_isnan") ? source : limit)
-                          << ", PT;\nSEL " << operand(destination)
-                          << ", RZ, 0x1, !P0;\n";
+                          << operand(name == toSlice("nx2_isnan") ? source : limit) << ", PT;\nSEL "
+                          << operand(destination) << ", RZ, 0x1, !P0;\n";
                 result.add(destination);
             }
             return result;
         }
-        if ((name == toSlice("nx2_all") || name == toSlice("nx2_any")) &&
-            inst->getArgCount() == 1)
+        if ((name == toSlice("nx2_all") || name == toSlice("nx2_any")) && inst->getArgCount() == 1)
         {
             auto type = as<IRVectorType>(inst->getArg(0)->getDataType());
             if (!type || type->getElementType()->getOp() != kIROp_BoolType ||
@@ -1080,7 +1571,7 @@ struct NX2Emitter
                     {NX2Operand::Kind::Literal,
                      0,
                      name == toSlice("nx2_log10") ? 0.30102999566398119521f
-                                                   : 0.69314718055994530942f}));
+                                                  : 0.69314718055994530942f}));
             }
             return result;
         }
@@ -1100,8 +1591,8 @@ struct NX2Emitter
                 auto start = reg(inst, a[lane]);
                 auto end = reg(inst, b[lane]);
                 auto difference = allocate(inst);
-                *assembly << "FADD.FTZ " << operand(difference) << ", " << operand(end)
-                          << ", -" << operand(start) << ";\n";
+                *assembly << "FADD.FTZ " << operand(difference) << ", " << operand(end) << ", -"
+                          << operand(start) << ";\n";
                 auto scaled = binary(inst, "FMUL.FTZ", difference, factor[lane]);
                 result.add(binary(inst, "FADD.FTZ", start, scaled));
             }
@@ -1118,14 +1609,13 @@ struct NX2Emitter
             for (auto source : a)
             {
                 auto destination = allocate(inst);
-                *assembly << "FADD.FTZ.SAT " << operand(destination) << ", RZ, "
-                          << operand(source) << ";\n";
+                *assembly << "FADD.FTZ.SAT " << operand(destination) << ", RZ, " << operand(source)
+                          << ";\n";
                 result.add(destination);
             }
             return result;
         }
-        if ((name == toSlice("nx2_min") || name == toSlice("nx2_max")) &&
-            inst->getArgCount() == 2)
+        if ((name == toSlice("nx2_min") || name == toSlice("nx2_max")) && inst->getArgCount() == 2)
         {
             auto b = value(inst->getArg(1));
             UInt count = width(inst->getDataType());
@@ -1138,8 +1628,8 @@ struct NX2Emitter
             {
                 auto source = reg(inst, a[lane]);
                 auto destination = allocate(inst);
-                *assembly << "FMNMX.FTZ " << operand(destination) << ", " << operand(source)
-                          << ", " << operand(b[lane])
+                *assembly << "FMNMX.FTZ " << operand(destination) << ", " << operand(source) << ", "
+                          << operand(b[lane])
                           << (name == toSlice("nx2_min") ? ", PT;\n" : ", !PT;\n");
                 result.add(destination);
             }
@@ -1194,13 +1684,12 @@ struct NX2Emitter
                     if (canWriteOutputBank && (*locations)[lane] < 4)
                         destination.index = (*locations)[lane];
                 }
-                auto opcode = name == toSlice("nx2_log2")  ? "MUFU.LG2 "
-                              : name == toSlice("nx2_exp2") ? "MUFU.EX2 "
-                              : name == toSlice("nx2_sqrt") ? "MUFU.SQRT "
+                auto opcode = name == toSlice("nx2_log2")    ? "MUFU.LG2 "
+                              : name == toSlice("nx2_exp2")  ? "MUFU.EX2 "
+                              : name == toSlice("nx2_sqrt")  ? "MUFU.SQRT "
                               : name == toSlice("nx2_rsqrt") ? "MUFU.RSQ "
-                                                            : "MUFU.RCP ";
-                *assembly << opcode
-                          << operand(destination) << ", " << operand(source) << ";\n";
+                                                             : "MUFU.RCP ";
+                *assembly << opcode << operand(destination) << ", " << operand(source) << ";\n";
                 result.add(destination);
             }
             else
@@ -1217,6 +1706,8 @@ struct NX2Emitter
         List<NX2Operand> result;
         if (auto literal = as<IRFloatLit>(inst))
             result.add({NX2Operand::Kind::Literal, 0, float(literal->getValue())});
+        else if (auto literal = as<IRBoolLit>(inst))
+            result.add({NX2Operand::Kind::IntegerLiteral, literal->getValue() ? 1u : 0u});
         else if (auto literal = as<IRIntLit>(inst))
         {
             auto type = literal->getDataType()->getOp();
@@ -1237,32 +1728,172 @@ struct NX2Emitter
                     reject(inst);
             }
         }
+        else if (
+            inst->getOp() == kIROp_GetElement &&
+            as<IRVectorType>(inst->getOperand(0)->getDataType()))
+        {
+            auto base = value(inst->getOperand(0));
+            auto index = value(inst->getOperand(1));
+            auto indexType = inst->getOperand(1)->getDataType()->getOp();
+            if (!width(inst->getOperand(0)->getDataType()) || index.getCount() != 1 ||
+                (indexType != kIROp_IntType && indexType != kIROp_UIntType))
+                reject(inst);
+            if (!failed)
+            {
+                if (auto literal = as<IRIntLit>(inst->getOperand(1)))
+                {
+                    if (literal->getValue() < 0 || literal->getValue() >= base.getCount())
+                        reject(inst);
+                    else
+                        result.add(base[Index(literal->getValue())]);
+                }
+                else
+                {
+                    auto indexRegister = reg(inst, index[0]);
+                    auto selected = reg(inst, base[0]);
+                    for (Index lane = 1; lane < base.getCount(); ++lane)
+                    {
+                        auto candidate = reg(inst, base[lane]);
+                        auto destination = allocate(inst);
+                        *assembly << "ISETP.NE.U32.AND P0, PT, " << operand(indexRegister) << ", 0x"
+                                  << UInt(lane) << ", PT;\nSEL " << operand(destination) << ", "
+                                  << operand(selected) << ", " << operand(candidate) << ", P0;\n";
+                        selected = destination;
+                    }
+                    result.add(selected);
+                }
+            }
+        }
         else if (inst->getOp() == kIROp_MakeVector)
         {
             for (UInt index = 0; index < inst->getOperandCount(); ++index)
                 result.addRange(value(inst->getOperand(index)));
         }
+        else if (inst->getOp() == kIROp_MakeVectorFromScalar)
+        {
+            auto vector = as<IRVectorType>(inst->getDataType());
+            auto scalar = value(inst->getOperand(0));
+            UInt count = width(inst->getDataType());
+            if (!vector || !count || scalar.getCount() != 1 ||
+                vector->getElementType() != inst->getOperand(0)->getDataType())
+                reject(inst);
+            else
+                for (UInt lane = 0; lane < count; ++lane)
+                    result.add(scalar[0]);
+        }
         else if (inst->getOp() == kIROp_Load)
             result = load(inst);
         else if (auto invocation = as<IRCall>(inst))
             result = call(invocation);
-        else if (inst->getOp() == kIROp_Eql)
+        else if (inst->getOp() == kIROp_Neg)
+        {
+            auto source = value(inst->getOperand(0));
+            auto count = width(inst->getDataType());
+            if (!count || source.getCount() != Index(count))
+                reject(inst);
+            if (!failed)
+            {
+                auto sign = reg(inst, {NX2Operand::Kind::IntegerLiteral, 0x80000000u});
+                for (auto lane : source)
+                {
+                    bool absolute = lane.absolute;
+                    lane.absolute = false;
+                    auto input = reg(inst, lane);
+                    auto destination = allocate(inst);
+                    *assembly << "LOP3.LUT " << operand(destination) << ", " << operand(input)
+                              << ", " << operand(sign) << ", RZ, " << (absolute ? "0xfc" : "0x3c")
+                              << ", !PT;\n";
+                    result.add(destination);
+                }
+            }
+        }
+        else if (inst->getOp() == kIROp_CastFloatToInt)
+        {
+            auto source = value(inst->getOperand(0));
+            if (inst->getDataType()->getOp() != kIROp_IntType ||
+                inst->getOperand(0)->getDataType()->getOp() != kIROp_FloatType ||
+                source.getCount() != 1)
+                reject(inst);
+            if (!failed)
+            {
+                auto input = reg(inst, source[0]);
+                auto destination = allocate(inst);
+                *assembly << "F2I.FTZ.TRUNC.NTZ " << operand(destination) << ", " << operand(input)
+                          << ";\n";
+                result.add(destination);
+            }
+        }
+        else if (
+            (inst->getOp() == kIROp_Eql || inst->getOp() == kIROp_Neq) &&
+            (inst->getOperand(0)->getDataType()->getOp() == kIROp_IntType ||
+             inst->getOperand(0)->getDataType()->getOp() == kIROp_UIntType) &&
+            inst->getOperand(0)->getDataType() == inst->getOperand(1)->getDataType())
         {
             auto left = value(inst->getOperand(0));
             auto right = value(inst->getOperand(1));
-            auto count = width(inst->getOperand(0)->getDataType());
-            if (!count || width(inst->getOperand(1)->getDataType()) != count ||
-                left.getCount() != Index(count) || right.getCount() != Index(count))
+            if (left.getCount() != 1 || right.getCount() != 1)
+                reject(inst);
+            if (!failed)
+            {
+                auto a = reg(inst, left[0]);
+                auto b = reg(inst, right[0]);
+                auto destination = allocate(inst);
+                *assembly << "ISETP.NE.U32.AND P0, PT, " << operand(a) << ", " << operand(b)
+                          << ", PT;\nSEL " << operand(destination) << ", RZ, 0x1, "
+                          << (inst->getOp() == kIROp_Eql ? "P0;\n" : "!P0;\n");
+                result.add(destination);
+            }
+        }
+        else if (
+            inst->getOp() == kIROp_Less &&
+            inst->getOperand(0)->getDataType()->getOp() == kIROp_IntType &&
+            inst->getOperand(1)->getDataType()->getOp() == kIROp_IntType)
+        {
+            auto left = value(inst->getOperand(0));
+            auto right = value(inst->getOperand(1));
+            if (left.getCount() != 1 || right.getCount() != 1)
+                reject(inst);
+            if (!failed)
+            {
+                auto a = reg(inst, left[0]);
+                auto b = reg(inst, right[0]);
+                auto destination = allocate(inst);
+                *assembly << "ISETP.LT.AND P0, PT, " << operand(a) << ", " << operand(b)
+                          << ", PT;\nSEL " << operand(destination) << ", RZ, 0x1, !P0;\n";
+                result.add(destination);
+            }
+        }
+        else if (
+            inst->getOp() == kIROp_Eql || inst->getOp() == kIROp_Neq ||
+            inst->getOp() == kIROp_Greater || inst->getOp() == kIROp_Geq ||
+            inst->getOp() == kIROp_Less)
+        {
+            auto left = value(inst->getOperand(0));
+            auto right = value(inst->getOperand(1));
+            auto leftWidth = width(inst->getOperand(0)->getDataType());
+            auto rightWidth = width(inst->getOperand(1)->getDataType());
+            auto count = leftWidth > rightWidth ? leftWidth : rightWidth;
+            if (!leftWidth || !rightWidth ||
+                (left.getCount() != 1 && left.getCount() != Index(count)) ||
+                (right.getCount() != 1 && right.getCount() != Index(count)))
                 reject(inst);
             if (!failed)
             {
                 for (UInt lane = 0; lane < count; ++lane)
                 {
-                    auto a = reg(inst, left[lane]);
-                    auto b = reg(inst, right[lane]);
+                    auto a = reg(inst, left[left.getCount() == 1 ? 0 : lane]);
+                    auto b = right[right.getCount() == 1 ? 0 : lane];
+                    bool zero = b.kind == NX2Operand::Kind::Literal && b.literal == 0.0f;
+                    if (!zero)
+                        b = reg(inst, b);
                     auto destination = allocate(inst);
-                    *assembly << "FSETP.EQ.FTZ.AND P0, PT, " << operand(a) << ", " << operand(b)
-                              << ", PT;\nSEL " << operand(destination) << ", RZ, 0x1, !P0;\n";
+                    *assembly << (inst->getOp() == kIROp_Greater ? "FSETP.GT.FTZ.AND P0, PT, "
+                                  : inst->getOp() == kIROp_Geq   ? "FSETP.GE.FTZ.AND P0, PT, "
+                                  : inst->getOp() == kIROp_Less  ? "FSETP.LT.FTZ.AND P0, PT, "
+                                                                 : "FSETP.EQ.FTZ.AND P0, PT, ")
+                              << operand(a) << ", " << (zero ? String("RZ") : operand(b))
+                              << ", PT;\nSEL " << operand(destination) << ", RZ, 0x1, "
+                              << (inst->getOp() == kIROp_Neq ? "P0;\n" : "!P0;\n");
                     result.add(destination);
                 }
             }
@@ -1310,15 +1941,35 @@ struct NX2Emitter
                     auto a = reg(inst, left[left.getCount() == 1 ? 0 : lane]);
                     auto b = reg(inst, right[right.getCount() == 1 ? 0 : lane]);
                     auto destination = allocate(inst);
-                    *assembly << "LOP3.LUT " << operand(destination) << ", " << operand(a)
-                              << ", " << operand(b) << ", RZ, "
+                    *assembly << "LOP3.LUT " << operand(destination) << ", " << operand(a) << ", "
+                              << operand(b) << ", RZ, "
                               << (inst->getOp() == kIROp_BitAnd ? "0xc0" : "0xfc") << ", !PT;\n";
                     result.add(destination);
                 }
             }
         }
         else if (
-            inst->getOp() == kIROp_Mul || inst->getOp() == kIROp_Add || inst->getOp() == kIROp_Div)
+            inst->getOp() == kIROp_Add && (inst->getDataType()->getOp() == kIROp_IntType ||
+                                           inst->getDataType()->getOp() == kIROp_UIntType))
+        {
+            auto left = value(inst->getOperand(0));
+            auto right = value(inst->getOperand(1));
+            if (left.getCount() != 1 || right.getCount() != 1 ||
+                inst->getOperand(0)->getDataType() != inst->getDataType() ||
+                inst->getOperand(1)->getDataType() != inst->getDataType())
+                reject(inst);
+            if (!failed)
+            {
+                auto source = reg(inst, left[0]);
+                auto destination = allocate(inst);
+                *assembly << "IADD3 " << operand(destination) << ", " << operand(source) << ", "
+                          << operand(right[0]) << ", RZ;\n";
+                result.add(destination);
+            }
+        }
+        else if (
+            inst->getOp() == kIROp_Mul || inst->getOp() == kIROp_Add ||
+            inst->getOp() == kIROp_Sub || inst->getOp() == kIROp_Div)
         {
             auto product = inst->getOperand(0);
             if (inst->getOp() == kIROp_Add && product->getOp() == kIROp_Mul &&
@@ -1369,11 +2020,34 @@ struct NX2Emitter
                                   << ";\n";
                         right = reciprocal;
                     }
-                    result.add(binary(
-                        inst,
-                        inst->getOp() == kIROp_Add ? "FADD.FTZ" : "FMUL.FTZ",
-                        left,
-                        right));
+                    if (inst->getOp() == kIROp_Sub)
+                    {
+                        left = reg(inst, left);
+                        auto destination = allocate(inst);
+                        *assembly << "FADD.FTZ " << operand(destination) << ", " << operand(left)
+                                  << ", ";
+                        if (right.kind == NX2Operand::Kind::Literal)
+                        {
+                            uint32_t bits;
+                            ::memcpy(&bits, &right.literal, sizeof(bits));
+                            if (right.absolute)
+                                bits &= 0x7fffffff;
+                            bits ^= 0x80000000;
+                            ::memcpy(&right.literal, &bits, sizeof(bits));
+                            right.absolute = false;
+                            *assembly << operand(right);
+                        }
+                        else
+                            *assembly << "-" << operand(right);
+                        *assembly << ";\n";
+                        result.add(destination);
+                    }
+                    else
+                        result.add(binary(
+                            inst,
+                            inst->getOp() == kIROp_Add ? "FADD.FTZ" : "FMUL.FTZ",
+                            left,
+                            right));
                 }
             }
         }
@@ -1383,21 +2057,330 @@ struct NX2Emitter
         return result;
     }
 
+    // Emit structured regions without moving work across branch arms.
+    // For example, a guarded division stays inside its original arm.
+    void emitConditionalRegion(Region* region, UInt depth, UInt outputCount)
+    {
+        if (!region || failed)
+            return;
+        switch (region->getFlavor())
+        {
+        case Region::Flavor::Simple:
+            {
+                auto simple = static_cast<SimpleRegion*>(region);
+                auto block = simple->block;
+                if (emittedBlocks.contains(block))
+                {
+                    reject(block);
+                    return;
+                }
+                emittedBlocks.add(block);
+                literalRegisters.clear();
+                for (auto inst : block->getOrdinaryInsts())
+                {
+                    switch (inst->getOp())
+                    {
+                    case kIROp_Var:
+                        {
+                            auto pointerType = as<IRPtrTypeBase>(inst->getDataType());
+                            UInt count = pointerType ? width(pointerType->getValueType()) : 0;
+                            if (pointerType &&
+                                (pointerType->getValueType()->getOp() == kIROp_IntType ||
+                                 pointerType->getValueType()->getOp() == kIROp_UIntType ||
+                                 pointerType->getValueType()->getOp() == kIROp_BoolType))
+                                count = 1;
+                            if (!count)
+                            {
+                                reject(inst);
+                                break;
+                            }
+                            List<NX2Operand> registers;
+                            for (UInt lane = 0; lane < count; ++lane)
+                                registers.add(allocate(inst));
+                            localVariables.add(inst, registers);
+                        }
+                        break;
+                    case kIROp_Store:
+                        {
+                            auto store = as<IRStore>(inst);
+                            auto local = localVariables.tryGetValue(store->getPtr());
+                            auto source = value(store->getVal());
+                            if (local && local->getCount() == source.getCount())
+                            {
+                                for (Index lane = 0; lane < source.getCount(); ++lane)
+                                    move((*local)[lane].index, source[lane]);
+                            }
+                            else if (
+                                store->getPtr()->getOp() == kIROp_GetElementPtr &&
+                                source.getCount() == 1)
+                            {
+                                auto address = store->getPtr();
+                                auto vectorLocal =
+                                    localVariables.tryGetValue(address->getOperand(0));
+                                auto pointer =
+                                    as<IRPtrTypeBase>(address->getOperand(0)->getDataType());
+                                auto vector =
+                                    pointer ? as<IRVectorType>(pointer->getValueType()) : nullptr;
+                                auto index = value(address->getOperand(1));
+                                auto indexType = address->getOperand(1)->getDataType()->getOp();
+                                if (!vectorLocal || !vector || index.getCount() != 1 ||
+                                    (indexType != kIROp_IntType && indexType != kIROp_UIntType))
+                                {
+                                    reject(inst);
+                                    break;
+                                }
+                                if (auto literal = as<IRIntLit>(address->getOperand(1)))
+                                {
+                                    if (literal->getValue() < 0 ||
+                                        literal->getValue() >= vectorLocal->getCount())
+                                        reject(inst);
+                                    else
+                                        move(
+                                            (*vectorLocal)[Index(literal->getValue())].index,
+                                            source[0]);
+                                }
+                                else
+                                {
+                                    auto indexRegister = reg(inst, index[0]);
+                                    auto replacement = reg(inst, source[0]);
+                                    for (Index lane = 0; lane < vectorLocal->getCount(); ++lane)
+                                    {
+                                        auto destination = allocate(inst);
+                                        *assembly << "ISETP.NE.U32.AND P0, PT, "
+                                                  << operand(indexRegister) << ", 0x" << UInt(lane)
+                                                  << ", PT;\nSEL " << operand(destination) << ", "
+                                                  << operand((*vectorLocal)[lane]) << ", "
+                                                  << operand(replacement) << ", P0;\n";
+                                        move((*vectorLocal)[lane].index, destination);
+                                    }
+                                }
+                            }
+                            else
+                                reject(inst);
+                        }
+                        break;
+                    case kIROp_Return:
+                        {
+                            if (depth || inst->getOperandCount() != 1)
+                            {
+                                reject(inst);
+                                break;
+                            }
+                            auto output = value(inst->getOperand(0));
+                            if (output.getCount() != Index(outputCount))
+                            {
+                                reject(inst);
+                                break;
+                            }
+                            for (UInt lane = 0; lane < outputCount; ++lane)
+                                move(lane, output[lane]);
+                            *assembly << "EXIT;\n";
+                        }
+                        break;
+                    case kIROp_IfElse:
+                    case kIROp_Loop:
+                    case kIROp_UnconditionalBranch:
+                    case kIROp_FieldAddress:
+                    case kIROp_GetElementPtr:
+                        break;
+                    case kIROp_Call:
+                        {
+                            auto invocation = as<IRCall>(inst);
+                            auto callee = as<IRFunc>(invocation->getCallee());
+                            auto body = callee ? callee->getFirstBlock() : nullptr;
+                            auto generic = body ? as<IRGenericAsm>(body->getTerminator()) : nullptr;
+                            auto name = generic ? as<IRStringLit>(generic->getOperand(0)) : nullptr;
+                            bool sample = name && name->getStringSlice() == toSlice("nx2_sample");
+                            if (sample && block != currentFunction->getFirstBlock())
+                                reject(inst);
+                            else
+                            {
+                                inConditionalEntryBlock = sample;
+                                value(inst);
+                                inConditionalEntryBlock = false;
+                            }
+                        }
+                        break;
+                    default:
+                        value(inst);
+                        break;
+                    }
+                    if (failed)
+                        return;
+                }
+                emitConditionalRegion(simple->nextRegion, depth, outputCount);
+            }
+            break;
+        case Region::Flavor::If:
+            {
+                auto conditional = static_cast<IfRegion*>(region);
+                if (depth >= kNX2ReconvergenceBarrierCount)
+                {
+                    reject(conditional->ifElseInst);
+                    return;
+                }
+                auto condition = value(conditional->getCondition());
+                if (condition.getCount() != 1)
+                {
+                    reject(conditional->ifElseInst);
+                    return;
+                }
+                auto predicate = reg(conditional->ifElseInst, condition[0]);
+                auto thenBreak = conditional->thenRegion && conditional->thenRegion->getFlavor() ==
+                                                                Region::Flavor::Break
+                                     ? static_cast<BreakRegion*>(conditional->thenRegion.get())
+                                     : nullptr;
+                auto elseBreak = conditional->elseRegion && conditional->elseRegion->getFlavor() ==
+                                                                Region::Flavor::Break
+                                     ? static_cast<BreakRegion*>(conditional->elseRegion.get())
+                                     : nullptr;
+                if (thenBreak || elseBreak)
+                {
+                    auto branch = thenBreak ? thenBreak : elseBreak;
+                    if (activeLoops.getCount() == 0 ||
+                        branch->outerRegion != activeLoops.getLast().region ||
+                        depth != activeLoops.getLast().depth + 1 || (thenBreak && elseBreak))
+                    {
+                        reject(conditional->ifElseInst);
+                        return;
+                    }
+                    *assembly << "ISETP.NE.U32.AND P0, PT, " << operand(predicate) << ", RZ, PT;\n"
+                              << (thenBreak ? "@P0 BRA " : "@!P0 BRA ") << "nx2_loop_sync_"
+                              << activeLoops.getLast().label << ";\n";
+                    emitConditionalRegion(
+                        thenBreak ? conditional->elseRegion.get() : conditional->thenRegion.get(),
+                        depth,
+                        outputCount);
+                    emitConditionalRegion(conditional->nextRegion, depth, outputCount);
+                    break;
+                }
+                UInt label = nextLabel++;
+                *assembly << "ISETP.NE.U32.AND P0, PT, " << operand(predicate)
+                          << ", RZ, PT;\nBSSY B" << depth << ", nx2_done_" << label
+                          << ";\n@!P0 BRA nx2_else_" << label << ";\n";
+                emitConditionalRegion(conditional->thenRegion, depth + 1, outputCount);
+                *assembly << "BRA nx2_merge_" << label << ";\nnx2_else_" << label << ":\n";
+                emitConditionalRegion(conditional->elseRegion, depth + 1, outputCount);
+                *assembly << "nx2_merge_" << label << ":\nBSYNC B" << depth << ";\nnx2_done_"
+                          << label << ":\n";
+                literalRegisters.clear();
+                emitConditionalRegion(conditional->nextRegion, depth, outputCount);
+            }
+            break;
+        case Region::Flavor::Loop:
+            {
+                auto loop = static_cast<LoopRegion*>(region);
+                if (depth >= kNX2ReconvergenceBarrierCount)
+                {
+                    reject(loop->loopInst);
+                    return;
+                }
+                UInt label = nextLabel++;
+                activeLoops.add({loop, depth, label});
+                *assembly << "BSSY B" << depth << ", nx2_loop_done_" << label
+                          << ";\nnx2_loop_start_" << label << ":\n";
+                emitConditionalRegion(loop->body, depth + 1, outputCount);
+                *assembly << "BRA nx2_loop_start_" << label << ";\nnx2_loop_sync_" << label
+                          << ":\nBSYNC B" << depth << ";\nnx2_loop_done_" << label << ":\n";
+                activeLoops.removeLast();
+                literalRegisters.clear();
+                emitConditionalRegion(loop->nextRegion, depth, outputCount);
+            }
+            break;
+        case Region::Flavor::Break:
+        case Region::Flavor::Continue:
+            {
+                auto target = region->getFlavor() == Region::Flavor::Break
+                                  ? static_cast<BreakableRegion*>(
+                                        static_cast<BreakRegion*>(region)->outerRegion)
+                                  : static_cast<BreakableRegion*>(
+                                        static_cast<ContinueRegion*>(region)->outerRegion);
+                if (activeLoops.getCount() == 0 || activeLoops.getLast().region != target ||
+                    depth < activeLoops.getLast().depth + 1 ||
+                    (region->getFlavor() == Region::Flavor::Continue &&
+                     depth != activeLoops.getLast().depth + 1))
+                {
+                    reject(currentFunction);
+                    return;
+                }
+                // BREAK removes transferring lanes from inner reconvergence barriers before
+                // the branch leaves their regions, as in the pinned deep-control-flow capture.
+                for (UInt barrier = depth; barrier-- > activeLoops.getLast().depth + 1;)
+                    *assembly << "BREAK B" << barrier << ";\n";
+                *assembly << "BRA nx2_loop_"
+                          << (region->getFlavor() == Region::Flavor::Break ? "sync_" : "start_")
+                          << activeLoops.getLast().label << ";\n";
+            }
+            break;
+        default:
+            reject(currentFunction);
+            break;
+        }
+    }
+
     SlangResult emit(IRFunc* function)
     {
+        currentFunction = function;
         auto block = function->getFirstBlock();
         auto layoutDecoration = function->findDecoration<IRLayoutDecoration>();
         auto layout =
             layoutDecoration ? as<IREntryPointLayout>(layoutDecoration->getLayout()) : nullptr;
         auto semantic = layout ? layout->getResultLayout()->findSystemValueSemanticAttr() : nullptr;
         UInt outputCount = width(function->getResultType());
-        if (!block || block->getNextBlock() || !outputCount || outputCount > 4 || !semantic ||
+        if (!block || !outputCount || outputCount > 4 || !semantic ||
             semantic->getName() != toSlice("SV_Target") || semantic->getIndex() != 0)
         {
             reject(function);
             return SLANG_FAIL;
         }
         *assembly << "// Experimental SM87 fragment assembly; modeled order, controls separate.\n";
+        if (block->getNextBlock())
+        {
+            if (auto param = block->getFirstParam())
+            {
+                auto mode = param->findDecoration<IRInterpolationModeDecoration>();
+                if (param->getNextParam() || nativeInterface != NX2Interface::PerspectiveTexture ||
+                    getNX2VaryingSlot(param) != 0 || width(param->getDataType()) != 2 ||
+                    (mode && mode->getMode() != IRInterpolationMode::Linear))
+                {
+                    reject(param);
+                    return SLANG_FAIL;
+                }
+                // TEXCOORD0 uses the captured perspective interface; virtual registers keep
+                // interpolation results live across control-flow joins without fixing R8/R9.
+                auto reciprocal = allocate(param);
+                *assembly << "IPA.PASS " << operand(reciprocal) << ", a[0x7c];\n"
+                          << "MUFU.RCP " << operand(reciprocal) << ", " << operand(reciprocal)
+                          << ";\n";
+                List<NX2Operand> uv;
+                for (UInt lane = 0; lane < 2; ++lane)
+                {
+                    auto interpolated = allocate(param);
+                    *assembly << "IPA.PASS " << operand(interpolated) << ", a["
+                              << StringUtil::makeStringWithFormat("0x%x", 0x80 + lane * 4)
+                              << "];\n";
+                    uv.add(binary(param, "FMUL.FTZ.RZ", reciprocal, interpolated));
+                }
+                values.add(param, uv);
+            }
+            for (auto current : function->getBlocks())
+            {
+                auto terminator = current->getTerminator();
+                if (!terminator ||
+                    (terminator->getOp() != kIROp_IfElse && terminator->getOp() != kIROp_Loop &&
+                     terminator->getOp() != kIROp_UnconditionalBranch &&
+                     terminator->getOp() != kIROp_Return))
+                {
+                    reject(terminator ? static_cast<IRInst*>(terminator) : function);
+                    return SLANG_FAIL;
+                }
+            }
+            auto regions = generateRegionTreeForFunc(function, sink);
+            if (!regions || sink->getErrorCount())
+                return SLANG_FAIL;
+            emitConditionalRegion(regions->rootRegion, 0, outputCount);
+            return failed ? SLANG_FAIL : SLANG_OK;
+        }
         auto terminator = block->getTerminator();
         if (!terminator || terminator->getOp() != kIROp_Return ||
             terminator->getOperandCount() != 1)
@@ -1449,7 +2432,8 @@ struct NX2Emitter
                     auto component = allocate(param);
                     *assembly << "IPA.PASS " << operand(component) << ", a["
                               << StringUtil::makeStringWithFormat(
-                                     "0x%x", UInt(0x80 + semanticIndex * 16 + lane * 4))
+                                     "0x%x",
+                                     UInt(0x80 + semanticIndex * 16 + lane * 4))
                               << "];\n";
                     components.add(component);
                 }
@@ -1471,23 +2455,23 @@ struct NX2Emitter
             Int semanticIndex = getNX2VaryingSlot(param);
             UInt count = width(param->getDataType());
             if (nativeInterface == NX2Interface::PerspectiveTexture && decoration &&
-                semanticIndex >= 0 &&
-                count >= 1 && count <= 4 && !param->getNextParam() &&
+                semanticIndex >= 0 && count >= 1 && count <= 4 && !param->getNextParam() &&
                 (count != 2 || semanticIndex != 0))
             {
                 // Each varying occupies a four-component slot after reciprocal W.
                 // For example, TEXCOORD1.x reads a[0x90], while TEXCOORD0.w reads a[0x8c].
                 auto reciprocal = allocate(param);
                 *assembly << "IPA.PASS " << operand(reciprocal) << ", a[0x7c];\n"
-                          << "MUFU.RCP " << operand(reciprocal) << ", "
-                          << operand(reciprocal) << ";\n";
+                          << "MUFU.RCP " << operand(reciprocal) << ", " << operand(reciprocal)
+                          << ";\n";
                 List<NX2Operand> components;
                 for (UInt lane = 0; lane < count; ++lane)
                 {
                     auto interpolated = allocate(param);
                     *assembly << "IPA.PASS " << operand(interpolated) << ", a["
                               << StringUtil::makeStringWithFormat(
-                                     "0x%x", UInt(0x80 + semanticIndex * 16 + lane * 4))
+                                     "0x%x",
+                                     UInt(0x80 + semanticIndex * 16 + lane * 4))
                               << "];\n";
                     components.add(binary(param, "FMUL.FTZ.RZ", reciprocal, interpolated));
                 }
@@ -1499,7 +2483,8 @@ struct NX2Emitter
                                             ? toSlice("SV_Position")
                                             : toSlice("TEXCOORD0");
                 if (param->getNextParam() || width(param->getDataType()) != 2 || !decoration ||
-                    cast<IRStringLit>(decoration->getOperand(0))->getStringSlice() != expectedSemantic)
+                    cast<IRStringLit>(decoration->getOperand(0))->getStringSlice() !=
+                        expectedSemantic)
                 {
                     reject(param);
                     return SLANG_FAIL;
@@ -1611,7 +2596,17 @@ SlangResult emitNX2Assembly(
     }
     NX2Emitter emitter{sink, &virtualAssembly, nativeInterface, sceneTextureABI};
     SLANG_RETURN_ON_FAIL(emitter.emit(entryPoint));
+    if (entryPoint->getFirstBlock()->getNextBlock())
+        return allocateNX2ConditionalRegisters(
+            virtualAssembly.toString(),
+            emitter.nextRegister,
+            emitter.width(entryPoint->getResultType()),
+            sink,
+            assembly);
     return allocateNX2Registers(
-        virtualAssembly.toString(), sink, emitter.width(entryPoint->getResultType()), assembly);
+        virtualAssembly.toString(),
+        sink,
+        emitter.width(entryPoint->getResultType()),
+        assembly);
 }
 } // namespace Slang

@@ -30,9 +30,9 @@
 #include "slang-ir-autodiff.h"
 #include "slang-ir-bind-existentials.h"
 #include "slang-ir-byte-address-legalize.h"
+#include "slang-ir-call-graph.h"
 #include "slang-ir-check-optional-none-usage.h"
 #include "slang-ir-check-recursion.h"
-#include "slang-ir-call-graph.h"
 #include "slang-ir-check-shader-parameter-type.h"
 #include "slang-ir-check-unsupported-inst.h"
 #include "slang-ir-cleanup-void.h"
@@ -734,25 +734,28 @@ bool checkStaticAssert(IRInst* inst, DiagnosticSink* sink)
                     IRInst* msg = inst->getOperand(1);
                     if (auto msgLit = as<IRStringLit>(msg))
                     {
-                        sink->diagnose(Diagnostics::StaticAssertionFailure{
-                            .message = String(msgLit->getStringSlice()),
-                            .location = inst->sourceLoc,
-                        });
+                        sink->diagnose(
+                            Diagnostics::StaticAssertionFailure{
+                                .message = String(msgLit->getStringSlice()),
+                                .location = inst->sourceLoc,
+                            });
                     }
                     else
                     {
-                        sink->diagnose(Diagnostics::StaticAssertionFailureWithoutMessage{
-                            .location = inst->sourceLoc,
-                        });
+                        sink->diagnose(
+                            Diagnostics::StaticAssertionFailureWithoutMessage{
+                                .location = inst->sourceLoc,
+                            });
                     }
                     diagnoseCallStack(inst, sink);
                 }
             }
             else
             {
-                sink->diagnose(Diagnostics::StaticAssertionConditionNotConstant{
-                    .location = condi->sourceLoc,
-                });
+                sink->diagnose(
+                    Diagnostics::StaticAssertionConditionNotConstant{
+                        .location = condi->sourceLoc,
+                    });
             }
 
             return true;
@@ -1044,7 +1047,7 @@ Result linkAndOptimizeIR(
 
     // This lambda is here so that we can select the correct overload for our parameters, without it
     // the overload deduction fails for passes which have overloads not taking an IRModule*
-#define SLANG_PASS(passFunc, ...)                                                          \
+#define SLANG_PASS(passFunc, ...) \
     wrapPass(                                                                              \
         codeGenContext,                                                                    \
         #passFunc,                                                                         \
@@ -1299,10 +1302,11 @@ Result linkAndOptimizeIR(
                 {
                     if (sink)
                     {
-                        sink->diagnose(Diagnostics::CoverageBindingOptionOutOfRange{
-                            .option = "-trace-coverage-reserved-space",
-                            .parsedValue = value.intValue,
-                        });
+                        sink->diagnose(
+                            Diagnostics::CoverageBindingOptionOutOfRange{
+                                .option = "-trace-coverage-reserved-space",
+                                .parsedValue = value.intValue,
+                            });
                     }
                     return SLANG_FAIL;
                 }
@@ -1337,9 +1341,10 @@ Result linkAndOptimizeIR(
         // `E45113` guarantee.
         if (counterByteWidth != 4 && counterByteWidth != 8)
         {
-            sink->diagnose(Diagnostics::CoverageCounterWidthBytesInvalid{
-                .byteWidth = counterByteWidth,
-            });
+            sink->diagnose(
+                Diagnostics::CoverageCounterWidthBytesInvalid{
+                    .byteWidth = counterByteWidth,
+                });
             return SLANG_FAIL;
         }
         // Metal cannot execute 64-bit counting-mode coverage: MSL provides no
@@ -2996,6 +3001,8 @@ SlangResult CodeGenContext::emitEntryPointsSourceFromIR(ComPtr<IArtifact>& outAr
         specializeModule(linked.module, getTargetProgram(), getSink(), options);
         if (getSink()->getErrorCount())
             return SLANG_FAIL;
+        replaceGlobalConstants(linked.module);
+        inlineGlobalConstantsForLegalization(linked.module, CodeGenTarget::NX2Assembly);
         // Target-switch specialization can leave a branch to the selected intrinsic block.
         simplifyCFG(linked.module, CFGSimplificationOptions::getFast());
         Dictionary<IRInst*, HashSet<IRFunc*>> referencingEntryPoints;
@@ -3018,12 +3025,19 @@ SlangResult CodeGenContext::emitEntryPointsSourceFromIR(ComPtr<IArtifact>& outAr
                 }
             }
         }
-        if (linked.entryPoints.getCount() == 1 && lowerNX2MatrixVectorMul(linked.entryPoints[0]))
+        if (linked.entryPoints.getCount() == 1 && lowerNX2MatrixOperations(linked.entryPoints[0]))
         {
             legalizeMatrixTypes(linked.module, getTargetProgram(), getSink());
             if (getSink()->getErrorCount())
                 return SLANG_FAIL;
             // Fold legalized aggregate extracts without rewriting floating-point arithmetic.
+            for (auto inst = linked.module->getModuleInst()->getFirstChild(); inst;)
+            {
+                auto next = inst->getNextInst();
+                if (inst->getOp() == kIROp_GetElement)
+                    peepholeOptimizeInst(getTargetProgram(), linked.module, inst);
+                inst = next;
+            }
             for (auto block : linked.entryPoints[0]->getBlocks())
             {
                 for (auto inst = block->getFirstOrdinaryInst(); inst;)
@@ -3044,6 +3058,20 @@ SlangResult CodeGenContext::emitEntryPointsSourceFromIR(ComPtr<IArtifact>& outAr
                 linked.module,
                 linked.entryPoints[0],
                 PhiEliminationOptions::getFast());
+            lowerNX2AcyclicLoops(linked.entryPoints[0]);
+        }
+        if (linked.entryPoints.getCount() == 1 && lowerNX2LocalStructs(linked.entryPoints[0]))
+        {
+            // Fold aggregate field extracts without rewriting floating-point arithmetic.
+            for (auto block : linked.entryPoints[0]->getBlocks())
+                for (auto inst = block->getFirstOrdinaryInst(); inst;)
+                {
+                    auto next = inst->getNextInst();
+                    if (inst->getOp() == kIROp_FieldExtract)
+                        peepholeOptimizeInst(getTargetProgram(), linked.module, inst);
+                    inst = next;
+                }
+            eliminateDeadCode(linked.entryPoints[0]);
         }
         if (getTargetProgram()->getOptionSet().shouldDumpIR())
         {
@@ -3054,9 +3082,10 @@ SlangResult CodeGenContext::emitEntryPointsSourceFromIR(ComPtr<IArtifact>& outAr
         if (linked.entryPoints.getCount() != 1 || getEntryPointCount() != 1 ||
             getEntryPoint(getSingleEntryPointIndex())->getStage() != Stage::Fragment)
         {
-            getSink()->diagnose(Diagnostics::Unimplemented{
-                .feature = "NX2 SASS emitter currently requires one fragment entry point",
-                .location = SourceLoc()});
+            getSink()->diagnose(
+                Diagnostics::Unimplemented{
+                    .feature = "NX2 SASS emitter currently requires one fragment entry point",
+                    .location = SourceLoc()});
             return SLANG_FAIL;
         }
         SLANG_RETURN_ON_FAIL(emitNX2Assembly(
@@ -3183,8 +3212,9 @@ SlangResult CodeGenContext::emitEntryPointsSourceFromIR(ComPtr<IArtifact>& outAr
 
     if (!sourceEmitter)
     {
-        sink->diagnose(Diagnostics::UnableToGenerateCodeForTarget{
-            .target = TypeTextUtil::getCompileTargetName(SlangCompileTarget(target))});
+        sink->diagnose(
+            Diagnostics::UnableToGenerateCodeForTarget{
+                .target = TypeTextUtil::getCompileTargetName(SlangCompileTarget(target))});
         return SLANG_FAIL;
     }
 
@@ -3302,10 +3332,11 @@ SlangResult CodeGenContext::emitEntryPointsSourceFromIR(ComPtr<IArtifact>& outAr
 
     if (sourceMap)
     {
-        auto sourceMapArtifact = ArtifactUtil::createArtifact(ArtifactDesc::make(
-            ArtifactKind::Json,
-            ArtifactPayload::SourceMap,
-            ArtifactStyle::None));
+        auto sourceMapArtifact = ArtifactUtil::createArtifact(
+            ArtifactDesc::make(
+                ArtifactKind::Json,
+                ArtifactPayload::SourceMap,
+                ArtifactStyle::None));
 
         sourceMapArtifact->addRepresentation(sourceMap);
 
@@ -3967,8 +3998,9 @@ SlangResult emitLLVMForEntryPoints(CodeGenContext* codeGenContext, ComPtr<IArtif
     ISlangSharedLibrary* library = codeGenContext->getSession()->getOrLoadSlangLLVM();
     if (!library)
     {
-        codeGenContext->getSink()->diagnose(Diagnostics::UnableToGenerateCodeForTarget{
-            .target = TypeTextUtil::getCompileTargetName(SlangCompileTarget(target))});
+        codeGenContext->getSink()->diagnose(
+            Diagnostics::UnableToGenerateCodeForTarget{
+                .target = TypeTextUtil::getCompileTargetName(SlangCompileTarget(target))});
         return SLANG_FAIL;
     }
 

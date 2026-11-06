@@ -14970,11 +14970,12 @@ vector<T,N> mul(matrix<T,N,M> left, vector<T,M> right)
 // matrix-matrix
 __generic<T : __BuiltinFloatingPointType, let R : int, let N : int, let C : int>
 [__readNone]
-[require(cpp_cuda_glsl_hlsl_metal_spirv_wgsl_llvm, sm_4_0_version)]
+[require(nx2_pq_math)]
 matrix<T,R,C> mul(matrix<T,R,N> left, matrix<T,N,C> right)
 {
     __target_switch
     {
+    case nx2: __intrinsic_asm "nx2_matrix_matrix_mul";
     case glsl: __intrinsic_asm "($1 * $0)";
     case metal: __intrinsic_asm "($1 * $0)";
     case hlsl: __intrinsic_asm "mul";
@@ -16600,12 +16601,13 @@ vector<T,N> tanpi(vector<T,N> x)
 /// @category math
 __generic<T : __BuiltinFloatingPointType, let N : int, let M : int>
 [__readNone]
-[require(cpp_cuda_glsl_hlsl_metal_spirv_wgsl_llvm, sm_4_0_version)]
+[require(nx2_pq_math)]
 [PreferRecompute]
 matrix<T, M, N> transpose(matrix<T, N, M> x)
 {
     __target_switch
     {
+    case nx2: __intrinsic_asm "nx2_matrix_transpose";
     case glsl: __intrinsic_asm "transpose";
     case hlsl: __intrinsic_asm "transpose";
     case metal: __intrinsic_asm "transpose";
