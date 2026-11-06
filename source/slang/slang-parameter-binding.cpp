@@ -995,7 +995,7 @@ static void addExplicitParameterBindings_HLSL(
     RefPtr<VarLayout> varLayout)
 {
     // We only want to apply D3D `register` modifiers when compiling for
-    // D3D and Metal targets.
+    // D3D, Metal, and experimental NX2 targets.
     //
     // TODO: Nominally, the `register` keyword allows for a shader
     // profile to be specified, so that a given binding only
@@ -1012,7 +1012,8 @@ static void addExplicitParameterBindings_HLSL(
     // For now we do the filtering on target in a very direct fashion:
     //
     bool isMetal = isMetalTarget(context->getTargetRequest());
-    if (!isD3DTarget(context->getTargetRequest()) && !isMetal)
+    bool isNX2 = context->getTargetRequest()->getTarget() == CodeGenTarget::NX2Assembly;
+    if (!isD3DTarget(context->getTargetRequest()) && !isMetal && !isNX2)
         return;
 
     auto typeLayout = varLayout->typeLayout;

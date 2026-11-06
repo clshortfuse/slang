@@ -201,6 +201,10 @@ CapabilitySet TargetRequest::getTargetCaps()
         }
         break;
 
+    case CodeGenTarget::NX2Assembly:
+        atoms.add(CapabilityName::nx2);
+        break;
+
     case CodeGenTarget::CUDASource:
     case CodeGenTarget::CUDAHeader:
     case CodeGenTarget::PTX:

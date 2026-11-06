@@ -724,6 +724,8 @@ typedef uint32_t SlangSizeT;
         SLANG_HOST_LLVM_IR = 35,     ///< Host LLVM IR assembly
         SLANG_SHADER_LLVM_IR = 36,   ///< Host LLVM IR assembly (kernel/shader)
 
+        SLANG_NX2_ASM = 37, ///< Experimental SM87 graphics assembly text.
+
         SLANG_TARGET_COUNT_OF,
     };
 

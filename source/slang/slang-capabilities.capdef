@@ -103,6 +103,10 @@ def cpp : target + textualTarget;
 /// [Target]
 def cuda : target + textualTarget;
 
+/// Represents experimental SM87 native graphics assembly generation.
+/// [Target]
+def nx2 : target;
+
 /// Represents the Metal programming language code generation target.
 /// [Target]
 def metal : target + textualTarget;
@@ -2428,6 +2432,14 @@ alias texture_sm_4_1_compute_fragment = texture_sm_4_1;
 /// Capabilities required to use 'fragment shader only' texture operations
 /// [Compound]
 alias texture_sm_4_0_fragment = texture_sm_4_0;
+
+/// PQ arithmetic on existing targets or experimental native NX2.
+/// [Compound]
+alias nx2_pq_math = cpp_cuda_glsl_hlsl_metal_spirv_wgsl_llvm + sm_4_0_version | nx2;
+
+/// Basic texture sampling on existing targets or experimental NX2 fragments.
+/// [Compound]
+alias nx2_fragment_sample = cpp_cuda_glsl_hlsl_metal_spirv_wgsl + texture_sm_4_0_fragment | nx2 + fragment;
 /// Capabilities required to use 'fragment shader only' texture clamp operations
 /// [Compound]
 alias texture_sm_4_1_clamp_fragment = texture_sm_4_0_fragment | GL_ARB_sparse_texture_clamp;

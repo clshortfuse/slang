@@ -2976,12 +2976,14 @@ extension _Texture<T,Shape,isArray,isMS,sampleCount,0,isShadow,0,format>
     //@public:
     [__readNone]
     [ForceInline]
-    [require(cpp_cuda_glsl_hlsl_metal_spirv_wgsl, texture_sm_4_0_fragment)]
+    [require(nx2_fragment_sample)]
     T Sample(SamplerState s, vector<float, Shape.dimensions+isArray> location)
     {
         __requireComputeDerivative();
         __target_switch
         {
+            case nx2:
+                __intrinsic_asm "nx2_sample";
             case cpp:
                 __intrinsic_asm ".Sample";
             case hlsl:
@@ -8210,11 +8212,12 @@ matrix<T,N,M> abs(matrix<T,N,M> x)
 
 __generic<T : __BuiltinFloatingPointType>
 [__readNone]
-[require(cpp_cuda_glsl_hlsl_metal_spirv_wgsl_llvm, sm_4_0_version)]
+[require(nx2_pq_math)]
 T abs(T x)
 {
     __target_switch
     {
+    case nx2: __intrinsic_asm "nx2_abs";
     case hlsl: __intrinsic_asm "abs";
     case metal: __intrinsic_asm "abs";
     case glsl: __intrinsic_asm "abs";
@@ -8230,11 +8233,12 @@ T abs(T x)
 
 __generic<T : __BuiltinFloatingPointType, let N : int>
 [__readNone]
-[require(cpp_cuda_glsl_hlsl_metal_spirv_wgsl_llvm, sm_4_0_version)]
+[require(nx2_pq_math)]
 vector<T, N> abs(vector<T, N> x)
 {
     __target_switch
     {
+    case nx2: __intrinsic_asm "nx2_abs";
     case hlsl: __intrinsic_asm "abs";
     case metal: __intrinsic_asm "abs";
     case glsl: __intrinsic_asm "abs";
@@ -10945,7 +10949,7 @@ T __vectorDotImpl(vector<T, N> x, vector<T, N> y)
 // resolution, so that overload remains distinct from the broader arithmetic signature.
 __generic<T : __BuiltinFloatingPointType, let N : int>
 [__readNone]
-[require(cpp_cuda_glsl_hlsl_metal_spirv_wgsl_llvm, sm_4_0_version)]
+[require(nx2_pq_math)]
 T dot(vector<T, N> x, vector<T, N> y)
 {
     // Preserve the established concrete floating-point intrinsic path. A non-forced forwarding
@@ -10961,6 +10965,7 @@ T dot(vector<T, N> x, vector<T, N> y)
 
     __target_switch
     {
+    case nx2: __intrinsic_asm "nx2_dot";
     case glsl: __intrinsic_asm "dot";
     case hlsl: __intrinsic_asm "dot";
     case metal: __intrinsic_asm "dot";
@@ -11398,11 +11403,13 @@ matrix<T, N, M> exp(matrix<T, N, M> x)
 /// @category math
 __generic<T : __BuiltinFloatingPointType>
 [__readNone]
-[require(cpp_cuda_glsl_hlsl_metal_spirv_wgsl_llvm, sm_4_0_version)]
+[require(nx2_pq_math)]
 T exp2(T x)
 {
     __target_switch
     {
+    case nx2:
+        __intrinsic_asm "nx2_exp2";
     case glsl:
         __intrinsic_asm "exp2($0)";
     case spirv:
@@ -11434,11 +11441,12 @@ T exp2(T x)
 
 __generic<T : __BuiltinFloatingPointType, let N : int>
 [__readNone]
-[require(cpp_cuda_glsl_hlsl_metal_spirv_wgsl_llvm, sm_4_0_version)]
+[require(nx2_pq_math)]
 vector<T,N> exp2(vector<T,N> x)
 {
     __target_switch
     {
+    case nx2: __intrinsic_asm "nx2_exp2";
     case glsl:
         __intrinsic_asm "exp2($0)";
     case hlsl: __intrinsic_asm "exp2";
@@ -13299,6 +13307,7 @@ T lerp(T x, T y, T s)
 {
     __target_switch
     {
+    case nx2: __intrinsic_asm "nx2_lerp";
     case glsl: __intrinsic_asm "mix";
     case wgsl: __intrinsic_asm "mix";
     case metal: __intrinsic_asm "mix";
@@ -13317,6 +13326,7 @@ vector<T, N> lerp(vector<T, N> x, vector<T, N> y, vector<T, N> s)
 {
     __target_switch
     {
+    case nx2: __intrinsic_asm "nx2_lerp";
     case glsl: __intrinsic_asm "mix";
     case wgsl: __intrinsic_asm "mix";
     case metal: __intrinsic_asm "mix";
@@ -13494,11 +13504,12 @@ matrix<T,N,M> log10(matrix<T,N,M> x)
 /// @category math
 __generic<T : __BuiltinFloatingPointType>
 [__readNone]
-[require(cpp_cuda_glsl_hlsl_metal_spirv_wgsl_llvm, sm_4_0_version)]
+[require(nx2_pq_math)]
 T log2(T x)
 {
     __target_switch
     {
+    case nx2: __intrinsic_asm "nx2_log2";
     case cpp: __intrinsic_asm "$P_log2($0)";
     case cuda: __intrinsic_asm "$P_log2($0)";
     case glsl: __intrinsic_asm "log2";
@@ -13514,11 +13525,12 @@ T log2(T x)
 
 __generic<T : __BuiltinFloatingPointType, let N : int>
 [__readNone]
-[require(cpp_cuda_glsl_hlsl_metal_spirv_wgsl_llvm, sm_4_0_version)]
+[require(nx2_pq_math)]
 vector<T,N> log2(vector<T,N> x)
 {
     __target_switch
     {
+    case nx2: __intrinsic_asm "nx2_log2";
     case glsl: __intrinsic_asm "log2";
     case hlsl: __intrinsic_asm "log2";
     case metal: __intrinsic_asm "log2";
@@ -13898,10 +13910,12 @@ __generic<T : __BuiltinFloatingPointType>
 [__readNone]
 [ForceInline]
 [require(cpp_cuda_glsl_hlsl_metal_spirv_wgsl_llvm, sm_4_0_version)]
+[require(nx2_pq_math)]
 T max(T x, T y)
 {
     __target_switch
     {
+    case nx2: __intrinsic_asm "nx2_max";
     case llvm:
         // Unfortunately, as of LLVM 21.1.1, maximumnum seems to generate
         // invalid code on x86.
@@ -13920,9 +13934,14 @@ __generic<T : __BuiltinFloatingPointType, let N : int>
 [__readNone]
 [ForceInline]
 [require(cpp_cuda_glsl_hlsl_metal_spirv_wgsl_llvm, sm_4_0_version)]
+[require(nx2_pq_math)]
 vector<T, N> max(vector<T, N> x, vector<T, N> y)
 {
-    return __vectorMaxImpl(x, y);
+    __target_switch
+    {
+    case nx2: __intrinsic_asm "nx2_max";
+    default: return __vectorMaxImpl(x, y);
+    }
 }
 
 /// @category math
@@ -14247,10 +14266,12 @@ __generic<T : __BuiltinFloatingPointType>
 [__readNone]
 [ForceInline]
 [require(cpp_cuda_glsl_hlsl_metal_spirv_wgsl_llvm, sm_4_0_version)]
+[require(nx2_pq_math)]
 T min(T x, T y)
 {
     __target_switch
     {
+    case nx2: __intrinsic_asm "nx2_min";
     // Need to handle llvm case here because we need to call isnan(),
     // which takes __BuiltinFloatingPointType
     case llvm:
@@ -14269,9 +14290,14 @@ __generic<T : __BuiltinFloatingPointType, let N : int>
 [__readNone]
 [ForceInline]
 [require(cpp_cuda_glsl_hlsl_metal_spirv_wgsl_llvm, sm_4_0_version)]
+[require(nx2_pq_math)]
 vector<T,N> min(vector<T,N> x, vector<T,N> y)
 {
-    return __vectorMinImpl(x, y);
+    __target_switch
+    {
+    case nx2: __intrinsic_asm "nx2_min";
+    default: return __vectorMinImpl(x, y);
+    }
 }
 
 /// @category math
@@ -15813,10 +15839,12 @@ matrix<T, N, M> rsqrt(matrix<T, N, M> x)
 __generic<T : __BuiltinFloatingPointType>
 [__readNone]
 [require(cpp_cuda_glsl_hlsl_metal_spirv_wgsl_llvm, sm_4_0_version)]
+[require(nx2_pq_math)]
 T saturate(T x)
 {
     __target_switch
     {
+    case nx2: __intrinsic_asm "nx2_saturate";
     case hlsl: __intrinsic_asm "saturate";
     case metal: __intrinsic_asm "saturate";
     case wgsl: __intrinsic_asm "saturate";
@@ -15828,10 +15856,12 @@ T saturate(T x)
 __generic<T : __BuiltinFloatingPointType, let N : int>
 [__readNone]
 [require(cpp_cuda_glsl_hlsl_metal_spirv_wgsl_llvm, sm_4_0_version)]
+[require(nx2_pq_math)]
 vector<T,N> saturate(vector<T,N> x)
 {
     __target_switch
     {
+    case nx2: __intrinsic_asm "nx2_saturate";
     case hlsl: __intrinsic_asm "saturate";
     case metal: __intrinsic_asm "saturate";
     case wgsl: __intrinsic_asm "saturate";

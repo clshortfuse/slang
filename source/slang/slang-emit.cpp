@@ -19,6 +19,7 @@
 #include "slang-emit-hlsl.h"
 #include "slang-emit-llvm.h"
 #include "slang-emit-metal.h"
+#include "slang-emit-nx2.h"
 #include "slang-emit-slang.h"
 #include "slang-emit-source-writer.h"
 #include "slang-emit-torch.h"
@@ -2981,6 +2982,40 @@ SlangResult CodeGenContext::emitEntryPointsSourceFromIR(ComPtr<IArtifact>& outAr
     SLANG_PROFILE;
 
     outArtifact.setNull();
+
+    if (getTargetFormat() == CodeGenTarget::NX2Assembly)
+    {
+        auto linked = linkIR(this);
+        if (getSink()->getErrorCount())
+            return SLANG_FAIL;
+        SpecializationOptions options;
+        options.lowerWitnessLookups = true;
+        specializeModule(linked.module, getTargetProgram(), getSink(), options);
+        if (getSink()->getErrorCount())
+            return SLANG_FAIL;
+        if (getTargetProgram()->getOptionSet().shouldDumpIR())
+        {
+            DiagnosticSinkWriter writer(getSink());
+            dumpIR(linked.module, IRDumpOptions(), "NX2-SPECIALIZED", getSourceManager(), &writer);
+        }
+        StringBuilder assembly;
+        if (linked.entryPoints.getCount() != 1 || getEntryPointCount() != 1 ||
+            getEntryPoint(getSingleEntryPointIndex())->getStage() != Stage::Fragment)
+        {
+            getSink()->diagnose(Diagnostics::Unimplemented{
+                .feature = "NX2 SASS emitter currently requires one fragment entry point",
+                .location = SourceLoc()});
+            return SLANG_FAIL;
+        }
+        SLANG_RETURN_ON_FAIL(emitNX2Assembly(
+            linked.entryPoints[0],
+            getSink(),
+            &assembly));
+        auto artifact = ArtifactUtil::createArtifactForCompileTarget(SLANG_NX2_ASM);
+        artifact->addRepresentationUnknown(StringBlob::moveCreate(assembly));
+        outArtifact = artifact;
+        return SLANG_OK;
+    }
 
     auto session = getSession();
     auto sink = getSink();

@@ -2968,6 +2968,7 @@ LayoutRulesFamilyImpl* getDefaultLayoutRulesFamilyForTarget(TargetRequest* targe
 {
     switch (targetReq->getTarget())
     {
+    case CodeGenTarget::NX2Assembly:
     case CodeGenTarget::HLSL:
     case CodeGenTarget::DXBytecode:
     case CodeGenTarget::DXBytecodeAssembly:

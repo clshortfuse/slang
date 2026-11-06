@@ -1266,6 +1266,7 @@ SlangResult CodeGenContext::emitEntryPoints(ComPtr<IArtifact>& outArtifact)
         break;
     case CodeGenTarget::GLSL:
     case CodeGenTarget::HLSL:
+    case CodeGenTarget::NX2Assembly:
     case CodeGenTarget::CUDASource:
     case CodeGenTarget::CUDAHeader:
     case CodeGenTarget::CPPSource:

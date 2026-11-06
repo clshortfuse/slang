@@ -273,6 +273,8 @@ SLANG_HIERARCHICAL_ENUM(ArtifactStyle, SLANG_ARTIFACT_STYLE, SLANG_ARTIFACT_STYL
         }
     case SLANG_HLSL:
         return Desc::make(Kind::Source, Payload::HLSL, Style::Kernel, 0);
+    case SLANG_NX2_ASM:
+        return Desc::make(Kind::Assembly, Payload::None, Style::Kernel, 0);
     case SLANG_SPIRV:
         return Desc::make(Kind::ObjectCode, Payload::SPIRV, Style::Kernel, 0);
     case SLANG_SPIRV_ASM:
