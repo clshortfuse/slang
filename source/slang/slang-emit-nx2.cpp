@@ -4,6 +4,7 @@
 #include "slang-diagnostics.h"
 #include "slang-ir-insts.h"
 #include "slang-ir-util.h"
+#include "slang-parameter-binding.h"
 
 namespace Slang
 {
@@ -14,6 +15,24 @@ enum class NX2Interface
     PerspectiveTexture,
     ScreenTexture
 };
+
+// Return the native TEXCOORD slot, or -1 when the semantic is outside this interface.
+// For example, TEXCOORD1.x occupies a[0x90] in the four-component slot layout.
+Int getNX2VaryingSlot(IRParam* param)
+{
+    auto decoration = param->findDecoration<IRSemanticDecoration>();
+    if (!decoration)
+        return -1;
+    UnownedStringSlice name;
+    UnownedStringSlice digits;
+    splitNameAndIndex(decoration->getSemanticName(), name, digits);
+    Int index = decoration->getEffectiveSemanticIndex();
+    if (name != toSlice("TEXCOORD") ||
+        (digits.getLength() && SLANG_FAILED(StringUtil::parseInt(digits, index))) ||
+        index < 0 || index >= 32)
+        return -1;
+    return index;
+}
 
 struct NX2LiveInterval
 {
@@ -51,6 +70,7 @@ struct NX2ScheduledInstruction
 void scheduleNX2Lines(
     const List<NX2NativeLine>& lines,
     const List<NX2LiveInterval>& intervals,
+    UInt outputCount,
     StringBuilder* output)
 {
     List<NX2ScheduledInstruction> program;
@@ -91,7 +111,7 @@ void scheduleNX2Lines(
         List<UInt> writes;
         if (exit)
         {
-            for (UInt number = 0; number < 4; ++number)
+            for (UInt number = 0; number < outputCount; ++number)
                 reads.add(number);
         }
         else if (texture)
@@ -176,7 +196,11 @@ void scheduleNX2Lines(
 
 // Allocate each native definition separately so read-before-write operands may share a register.
 // Fixed intervals include future output writes, not just registers already assigned by the scan.
-SlangResult allocateNX2Registers(const String& input, DiagnosticSink* sink, StringBuilder* output)
+SlangResult allocateNX2Registers(
+    const String& input,
+    DiagnosticSink* sink,
+    UInt outputCount,
+    StringBuilder* output)
 {
     List<NX2NativeLine> lines;
     List<NX2LiveInterval> intervals;
@@ -237,7 +261,7 @@ SlangResult allocateNX2Registers(const String& input, DiagnosticSink* sink, Stri
         bool exit = text == toSlice("EXIT;");
         if (exit)
         {
-            for (UInt number = 0; number < 4; ++number)
+            for (UInt number = 0; number < outputCount; ++number)
                 read(number, instruction * 2);
         }
         else if (texture)
@@ -333,7 +357,7 @@ SlangResult allocateNX2Registers(const String& input, DiagnosticSink* sink, Stri
                 .location = SourceLoc()});
         return SLANG_FAIL;
     }
-    scheduleNX2Lines(lines, intervals, output);
+    scheduleNX2Lines(lines, intervals, outputCount, output);
     return SLANG_OK;
 }
 
@@ -847,7 +871,8 @@ struct NX2Emitter
         auto layout =
             layoutDecoration ? as<IREntryPointLayout>(layoutDecoration->getLayout()) : nullptr;
         auto semantic = layout ? layout->getResultLayout()->findSystemValueSemanticAttr() : nullptr;
-        if (!block || block->getNextBlock() || width(function->getResultType()) != 4 || !semantic ||
+        UInt outputCount = width(function->getResultType());
+        if (!block || block->getNextBlock() || !outputCount || outputCount > 4 || !semantic ||
             semantic->getName() != toSlice("SV_Target") || semantic->getIndex() != 0)
         {
             reject(function);
@@ -883,38 +908,103 @@ struct NX2Emitter
                     markOutput(rgb, lane, lane);
             }
         }
-        if (auto param = block->getFirstParam())
+        auto firstParam = block->getFirstParam();
+        auto interpolation =
+            firstParam ? firstParam->findDecoration<IRInterpolationModeDecoration>() : nullptr;
+        if (interpolation && interpolation->getMode() == IRInterpolationMode::NoPerspective)
         {
-            auto decoration = param->findDecoration<IRSemanticDecoration>();
-            auto expectedSemantic = nativeInterface == NX2Interface::ScreenTexture
-                                        ? toSlice("SV_Position")
-                                        : toSlice("TEXCOORD0");
-            if (param->getNextParam() ||
-                width(param->getDataType()) != 2 || !decoration ||
-                cast<IRStringLit>(decoration->getOperand(0))->getStringSlice() != expectedSemantic)
+            for (auto param : block->getParams())
             {
-                reject(param);
-                return SLANG_FAIL;
-            }
-            if (nativeInterface == NX2Interface::ScreenTexture)
-                *assembly << "IPA.PASS R8, a[0x70];\nIPA.PASS R9, a[0x74];\n";
-            else
-                *assembly << "IPA.PASS R10, a[0x7c];\nIPA.PASS R8, a[0x80];\n"
-                             "IPA.PASS R9, a[0x84];\nMUFU.RCP R10, R10;\n"
-                             "FMUL.FTZ.RZ R8, R10, R8;\nFMUL.FTZ.RZ R9, R10, R9;\n";
-            List<NX2Operand> uv;
-            for (UInt lane = 0; lane < 2; ++lane)
-            {
-                NX2Operand coordinate{NX2Operand::Kind::Register, 8 + lane};
-                if (nativeInterface == NX2Interface::ScreenTexture)
+                auto mode = param->findDecoration<IRInterpolationModeDecoration>();
+                Int semanticIndex = getNX2VaryingSlot(param);
+                UInt count = width(param->getDataType());
+                if (!mode || mode->getMode() != IRInterpolationMode::NoPerspective ||
+                    semanticIndex < 0 || !count || count > 4)
                 {
-                    auto saved = allocate(param);
-                    move(saved.index, coordinate);
-                    coordinate = saved;
+                    reject(param);
+                    return SLANG_FAIL;
                 }
-                uv.add(coordinate);
+                List<NX2Operand> components;
+                for (UInt lane = 0; lane < count; ++lane)
+                {
+                    auto component = allocate(param);
+                    *assembly << "IPA.PASS " << operand(component) << ", a["
+                              << StringUtil::makeStringWithFormat(
+                                     "0x%x", UInt(0x80 + semanticIndex * 16 + lane * 4))
+                              << "];\n";
+                    components.add(component);
+                }
+                values.add(param, components);
             }
-            values.add(param, uv);
+        }
+        else if (auto param = firstParam)
+        {
+            for (auto decoration : param->getDecorations())
+            {
+                if (auto mode = as<IRInterpolationModeDecoration>(decoration);
+                    mode && mode->getMode() != IRInterpolationMode::Linear)
+                {
+                    reject(param);
+                    return SLANG_FAIL;
+                }
+            }
+            auto decoration = param->findDecoration<IRSemanticDecoration>();
+            Int semanticIndex = getNX2VaryingSlot(param);
+            UInt count = width(param->getDataType());
+            if (nativeInterface == NX2Interface::PerspectiveTexture && decoration &&
+                semanticIndex >= 0 &&
+                count >= 1 && count <= 4 && !param->getNextParam() &&
+                (count != 2 || semanticIndex != 0))
+            {
+                // Each varying occupies a four-component slot after reciprocal W.
+                // For example, TEXCOORD1.x reads a[0x90], while TEXCOORD0.w reads a[0x8c].
+                auto reciprocal = allocate(param);
+                *assembly << "IPA.PASS " << operand(reciprocal) << ", a[0x7c];\n"
+                          << "MUFU.RCP " << operand(reciprocal) << ", "
+                          << operand(reciprocal) << ";\n";
+                List<NX2Operand> components;
+                for (UInt lane = 0; lane < count; ++lane)
+                {
+                    auto interpolated = allocate(param);
+                    *assembly << "IPA.PASS " << operand(interpolated) << ", a["
+                              << StringUtil::makeStringWithFormat(
+                                     "0x%x", UInt(0x80 + semanticIndex * 16 + lane * 4))
+                              << "];\n";
+                    components.add(binary(param, "FMUL.FTZ.RZ", reciprocal, interpolated));
+                }
+                values.add(param, components);
+            }
+            else
+            {
+                auto expectedSemantic = nativeInterface == NX2Interface::ScreenTexture
+                                            ? toSlice("SV_Position")
+                                            : toSlice("TEXCOORD0");
+                if (param->getNextParam() || width(param->getDataType()) != 2 || !decoration ||
+                    cast<IRStringLit>(decoration->getOperand(0))->getStringSlice() != expectedSemantic)
+                {
+                    reject(param);
+                    return SLANG_FAIL;
+                }
+                if (nativeInterface == NX2Interface::ScreenTexture)
+                    *assembly << "IPA.PASS R8, a[0x70];\nIPA.PASS R9, a[0x74];\n";
+                else
+                    *assembly << "IPA.PASS R10, a[0x7c];\nIPA.PASS R8, a[0x80];\n"
+                                 "IPA.PASS R9, a[0x84];\nMUFU.RCP R10, R10;\n"
+                                 "FMUL.FTZ.RZ R8, R10, R8;\nFMUL.FTZ.RZ R9, R10, R9;\n";
+                List<NX2Operand> uv;
+                for (UInt lane = 0; lane < 2; ++lane)
+                {
+                    NX2Operand coordinate{NX2Operand::Kind::Register, 8 + lane};
+                    if (nativeInterface == NX2Interface::ScreenTexture)
+                    {
+                        auto saved = allocate(param);
+                        move(saved.index, coordinate);
+                        coordinate = saved;
+                    }
+                    uv.add(coordinate);
+                }
+                values.add(param, uv);
+            }
         }
         for (auto inst : block->getOrdinaryInsts())
         {
@@ -936,7 +1026,7 @@ struct NX2Emitter
             }
         }
         auto output = value(terminator->getOperand(0));
-        if (failed || output.getCount() != 4)
+        if (failed || output.getCount() != Index(outputCount))
             return SLANG_FAIL;
         bool positiveZero = true;
         for (auto value : output)
@@ -946,13 +1036,13 @@ struct NX2Emitter
             if (value.kind != NX2Operand::Kind::Literal || bits != 0)
                 positiveZero = false;
         }
-        if (positiveZero)
+        if (positiveZero && outputCount == 4)
         {
             *assembly << "CS2R R0, SRZ;\nCS2R R2, SRZ;\nEXIT;\n";
             return SLANG_OK;
         }
         bool needsParallelCopy = false;
-        for (UInt lane = 0; lane < 4; ++lane)
+        for (UInt lane = 0; lane < outputCount; ++lane)
         {
             if (output[lane].absolute && output[lane].kind != NX2Operand::Kind::Literal)
                 reject(terminator);
@@ -964,13 +1054,13 @@ struct NX2Emitter
             return SLANG_FAIL;
         if (needsParallelCopy)
         {
-            for (UInt lane = 0; lane < 4; ++lane)
+            for (UInt lane = 0; lane < outputCount; ++lane)
             {
                 move(4 + lane, output[lane]);
                 output[lane] = {NX2Operand::Kind::Register, 4 + lane};
             }
         }
-        for (UInt lane = 0; lane < 4; ++lane)
+        for (UInt lane = 0; lane < outputCount; ++lane)
             move(lane, output[lane]);
         *assembly << "EXIT;\n";
         return failed ? SLANG_FAIL : SLANG_OK;
@@ -1001,6 +1091,7 @@ SlangResult emitNX2Assembly(
     }
     NX2Emitter emitter{sink, &virtualAssembly, nativeInterface};
     SLANG_RETURN_ON_FAIL(emitter.emit(entryPoint));
-    return allocateNX2Registers(virtualAssembly.toString(), sink, assembly);
+    return allocateNX2Registers(
+        virtualAssembly.toString(), sink, emitter.width(entryPoint->getResultType()), assembly);
 }
 } // namespace Slang
